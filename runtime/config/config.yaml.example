@@ -1,0 +1,105 @@
+# subs-check-pro 手机远程管理配置模板
+# 复制为 config.yaml 后替换 CHANGE_ME；不要提交真实凭据和订阅地址。
+
+print-progress: false
+progress-mode: "auto"
+cron-expression: ""
+check-interval: 10080
+
+alive-concurrent: 100
+speed-concurrent: 3
+media-concurrent: 20
+concurrent: 20
+timeout: 5000
+success-limit: 0
+ipv6: false
+keep-success-proxies: true
+
+min-speed: 130
+download-timeout: 8
+download-mb: 10
+total-speed-limit: 18
+speed-test-url: "random"
+threshold: 0.75
+gc-threshold: 20000
+
+rename-node: true
+media-check: false
+platforms: []
+
+listen-port: "127.0.0.1:8199"
+enable-web-ui: true
+api-key: "CHANGE_ME_TO_A_LONG_RANDOM_SECRET"
+share-password: ""
+
+sub-store-port: "9299"
+sub-store-path: "/CHANGE_ME_TO_A_RANDOM_PRIVATE_PATH"
+
+output-dir: "C:/ABSOLUTE/PATH/TO/runtime/output"
+save-method: "local"
+
+system-proxy: "direct"
+github-proxy: ""
+ghproxy-group: []
+
+# 自动更新会覆盖自定义重命名核心。
+update: false
+update-on-startup: false
+cron-check-update: "0 9 * * *"
+prerelease: false
+
+sub-urls-remote: []
+sub-urls: []
+github-token: ""
+github-gist-id: ""
+subs-parse-batch: 0
+subs-dedupe-batch: 0
+memory-limit-mb: 0
+gc-percent: 0
+sub-urls-retry: 0
+sub-urls-timeout: 0
+success-rate: 0
+media-check-timeout: 0
+enhanced-tag: false
+isp-check: false
+drop-bad-cf-nodes: false
+node-type: []
+node-loc: []
+webdav-url: ""
+webdav-username: ""
+webdav-password: ""
+github-api-mirror: ""
+worker-url: ""
+worker-token: ""
+s3-endpoint: ""
+s3-access-id: ""
+s3-secret-key: ""
+s3-bucket: ""
+s3-use-ssl: false
+s3-bucket-lookup: auto
+node-prefix: ""
+mihomo-overwrite-url: ""
+sub-process:
+  resolve-domain: false
+  node-split: false
+  sub-info: false
+  regex-filter-keep: true
+  regex-filter: []
+  regex-sort: []
+apprise-api-server: ""
+recipient-url: []
+notify-title: ""
+update-timeout: 0
+sub-store-sync-cron: ""
+sub-store-produce-cron: ""
+sub-store-push-service: ""
+singbox-latest:
+  version: ""
+  json: ""
+  js: ""
+singbox-old:
+  version: ""
+  json: ""
+  js: ""
+maxmind-db-path: ""
+callback-script: ""

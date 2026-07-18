@@ -1,0 +1,17 @@
+tunnel: CHANGE_ME_TUNNEL_UUID
+credentials-file: C:\ABSOLUTE\PATH\TO\runtime\cloudflared\credentials.json
+protocol: http2
+edge-ip-version: "4"
+metrics: 127.0.0.1:49312
+loglevel: info
+
+ingress:
+  - hostname: sub-store.example.com
+    service: http://127.0.0.1:9299
+    originRequest:
+      connectTimeout: 10s
+  - hostname: subs-check.example.com
+    service: http://127.0.0.1:8199
+    originRequest:
+      connectTimeout: 10s
+  - service: http_status:404

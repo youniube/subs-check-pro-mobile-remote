@@ -1,0 +1,10 @@
+* text=auto
+.gitattributes text eol=lf
+.gitignore text eol=lf
+*.ps1 text eol=crlf
+*.md text eol=lf
+*.patch text eol=lf -whitespace
+*.yaml text eol=lf
+*.yml text eol=lf
+*.yaml.example text eol=lf
+*.yml.example text eol=lf

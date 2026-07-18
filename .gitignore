@@ -1,0 +1,18 @@
+# Runtime binaries and generated state
+runtime/bin/
+runtime/logs/
+runtime/output/
+runtime/*.lock
+
+# Credentials and machine-specific configuration
+runtime/config/config.yaml
+runtime/cloudflared/config.yml
+runtime/cloudflared/credentials.json
+runtime/cloudflared/cert.pem
+runtime/cloudflared/*.log
+
+# Local editor and OS files
+.DS_Store
+Thumbs.db
+*.tmp
+*.bak
