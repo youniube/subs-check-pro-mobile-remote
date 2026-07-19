@@ -44,6 +44,7 @@
 
 ## 外部资源位置
 
+- 项目 GitHub 仓库：https://github.com/youniube/subs-check-pro-mobile-remote
 - 上游项目：https://github.com/sinspired/subs-check-pro
 - Cloudflare Tunnel 地址：https://cesusub.sbxm.eu.org
 - Sub-Store 前端地址：https://sub_store_for_subs_check.sbxm.eu.org
