@@ -32,7 +32,7 @@ enable-web-ui: true
 api-key: "CHANGE_ME_TO_A_LONG_RANDOM_SECRET"
 share-password: ""
 
-sub-store-port: "9299"
+sub-store-port: "8299"
 sub-store-path: "/CHANGE_ME_TO_A_RANDOM_PRIVATE_PATH"
 
 output-dir: "C:/ABSOLUTE/PATH/TO/runtime/output"

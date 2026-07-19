@@ -7,7 +7,7 @@ loglevel: info
 
 ingress:
   - hostname: sub-store.example.com
-    service: http://127.0.0.1:9299
+    service: http://127.0.0.1:8299
     originRequest:
       connectTimeout: 10s
   - hostname: subs-check.example.com

@@ -57,6 +57,13 @@ if ($listeners | Select-String -Pattern '^\s*TCP\s+127\.0\.0\.1:8199\s+[^\s]+\s+
     $failures.Add('127.0.0.1:8199')
 }
 
+if ($listeners | Select-String -Pattern '^\s*TCP\s+127\.0\.0\.1:8299\s+[^\s]+\s+LISTENING\s+\d+\s*$') {
+    Write-Output '[OK] Sub-Store listens only on 127.0.0.1:8299'
+} else {
+    Write-Output '[FAIL] Sub-Store does not listen on 127.0.0.1:8299'
+    $failures.Add('127.0.0.1:8299')
+}
+
 if ($listeners | Select-String -Pattern '^\s*TCP\s+127\.0\.0\.1:7890\s+[^\s]+\s+LISTENING\s+\d+\s*$') {
     Write-Output '[OK] Sparkle/Mihomo remains on 127.0.0.1:7890'
 } else {
