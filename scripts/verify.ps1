@@ -5,9 +5,9 @@ $ErrorActionPreference = 'Continue'
 $workspace = Split-Path -Parent $PSScriptRoot
 $exe = Join-Path $workspace 'runtime\bin\subs-check-pro.exe'
 $config = Join-Path $workspace 'runtime\config\config.yaml'
-$customCore = Join-Path $workspace 'runtime\bin\subs-check-pro-custom-v2.6.7.exe'
-$officialCore = Join-Path $workspace 'runtime\bin\subs-check-pro-official-v2.6.7.exe'
-$renamePatch = Join-Path $workspace 'patches\subs-check-pro-v2.6.7-custom-rename.patch'
+$customCore = Join-Path $workspace 'runtime\bin\subs-check-pro-custom-v2.6.8.exe'
+$officialCore = Join-Path $workspace 'runtime\bin\subs-check-pro-official-v2.6.8.exe'
+$renamePatch = Join-Path $workspace 'patches\subs-check-pro-v2.6.8-custom-rename.patch'
 $failures = New-Object System.Collections.Generic.List[string]
 
 function Test-RequiredPath {
@@ -23,7 +23,7 @@ function Test-RequiredPath {
 Test-RequiredPath -Path $exe -Label 'Executable exists'
 Test-RequiredPath -Path $config -Label 'Config exists'
 Test-RequiredPath -Path $customCore -Label 'Custom rename core exists'
-Test-RequiredPath -Path $officialCore -Label 'Official v2.6.7 core backup exists'
+Test-RequiredPath -Path $officialCore -Label 'Official v2.6.8 core backup exists'
 Test-RequiredPath -Path $renamePatch -Label 'Custom rename patch exists'
 
 try {
@@ -85,6 +85,23 @@ try {
 } catch {
     Write-Output "[FAIL] Local WebUI request failed: $($_.Exception.Message)"
     $failures.Add('WebUI HTTP')
+}
+
+try {
+    $versionInfo = Invoke-RestMethod -UseBasicParsing `
+        -Uri 'http://127.0.0.1:8199/admin/version' -TimeoutSec 8
+    if ($versionInfo.version -ne 'v2.6.8+custom.rename') {
+        throw "Unexpected active version: $($versionInfo.version)"
+    }
+    Write-Output '[OK] Active version uses non-prerelease custom metadata'
+    if ($versionInfo.latest_version) {
+        Write-Output "[WARN] Upstream release available: $($versionInfo.latest_version)"
+    } else {
+        Write-Output '[OK] Version API has no NEW badge state'
+    }
+} catch {
+    Write-Output "[FAIL] Version metadata verification failed: $($_.Exception.Message)"
+    $failures.Add('Version metadata')
 }
 
 try {
