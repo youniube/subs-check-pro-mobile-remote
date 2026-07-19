@@ -16,7 +16,7 @@
 - 使用当前用户启动项运行 subs-check-pro 和 cloudflared，避免管理员权限与现场 UAC；用户登录后自动启动。
 - cloudflared 固定使用 IPv4 边缘地址与 HTTP/2；原因是本机到 Cloudflare 的 IPv6 `7844` 端口超时，而 IPv4 HTTP/2 链路可稳定建立。
 - 已启用内置 Sub-Store；后端只监听 `127.0.0.1:8299`，并通过 Cloudflare Tunnel 的保留子域提供手机端前端和带私有路径的后端访问。
-- 核心基于官方 v2.6.7 应用了自定义节点重命名补丁：格式为 `🇭🇰 香港 01 | 1x`，地区内编号补齐两位，只保留原名已有倍率，IP 归属查询失败时保留原名。补丁位于 `patches/subs-check-pro-v2.6.7-custom-rename.patch`，复现脚本位于 `scripts/build-custom-core.ps1`，官方二进制备份位于 `runtime/bin/subs-check-pro-official-v2.6.7.exe`。
+- 核心基于官方 v2.6.8 应用了自定义节点重命名补丁：格式为 `🇭🇰 香港 01 | 1x`，地区内编号补齐两位，只保留原名中大于 0 的倍率（忽略 `0x` 等无效倍率），并按数值规范化前导零（`01x` → `1x`、`00.10x` → `0.1x`）。IP 归属查询失败时，继续从原名中的国旗、开头国家代码、中文或英文国家名推断地区；能识别就重命名，无法可靠识别才保留原名。补丁位于 `patches/subs-check-pro-v2.6.8-custom-rename.patch`，复现脚本位于 `scripts/build-custom-core.ps1`，官方二进制备份位于 `runtime/bin/subs-check-pro-official-v2.6.8.exe`。自定义版本使用 SemVer 构建元数据 `v2.6.8+custom.rename`，避免把同基线补丁误判为低于官方正式版。
 - 为避免官方升级覆盖自定义核心，核心自动更新已关闭；升级前需要把重命名补丁迁移到目标版本、运行相关 Go 测试并重新构建。
 
 ## 已知问题与踩坑
@@ -26,7 +26,8 @@
 - 电脑休眠、关机、用户未登录或 Cloudflare Tunnel 断开时，手机无法访问 WebUI。
 - Tailscale Windows MSI 需要管理员令牌和现场 UAC 确认；当前用户只能用手机远程操作 Codex，无法处理安全桌面，因此安装已取消。
 - 上游会在 info 日志记录启动配置中的 API Key；为保留成功提示，启动脚本使用 `LOG_LEVEL=info`，并每 500 毫秒对主日志中的密钥做等长原位掩码，避免破坏正在写入的文件；历史日志中的密钥也已清除。
-- subs-check-pro v2.6.7 会把配置中的 `127.0.0.1:8299` 误判为非法 Sub-Store 端口；当前用纯端口 `8299` 配合 `SUB_STORE_BACKEND_API_HOST=127.0.0.1` 强制回环监听。
+- subs-check-pro v2.6.x 会把配置中的 `127.0.0.1:8299` 误判为非法 Sub-Store 端口；当前用纯端口 `8299` 配合 `SUB_STORE_BACKEND_API_HOST=127.0.0.1` 强制回环监听。
+- 2026-07-19 上游发布 v2.6.8 后，旧的 v2.6.7 自定义核心显示 `NEW` 属于真实版本提醒，并非仅由重命名补丁造成；升级自定义基线后提醒消失。
 - 手机旧配置页面执行“保存配置”会覆盖后台刚更新的端口或私有路径；后台改动后应先刷新页面再继续编辑。
 - 2026-07-19 迁移时发现手机配置曾把 `sub-store-port` 漂移到 `9299`，而 Tunnel 仍转发 `8299`；现已统一恢复 `8299`，`scripts/verify.ps1` 会把端口不一致视为失败。
 - `sub-urls-remote` 只接收“远程订阅链接清单”的地址，不接收普通机场订阅；普通订阅误放其中时，单行响应超过 64 KiB 会触发 `bufio.Scanner: token too long`，应放入 `sub-urls` 或 Sub-Store。
@@ -39,9 +40,11 @@
 - 用户将最终访问域名从已有记录的 `cesu.sbxm.eu.org` 改为 `cesusub.sbxm.eu.org`。
 - 用户选择使用较短的自定义 API Key；公网入口存在弱口令风险，后续应优先改用强密钥或增加 Cloudflare Access。
 - 默认中文说明，技术决策需要解释原因和对用户的影响。
+- 归属查询失败的节点不能一律标成“未知”；原名含国家国旗、代码或中英文国家名时，应先据此重命名，确实没有可靠国家信息时才保留原名。
 
 ## 外部资源位置
 
+- 项目 GitHub 仓库：https://github.com/youniube/subs-check-pro-mobile-remote
 - 上游项目：https://github.com/sinspired/subs-check-pro
 - Cloudflare Tunnel 地址：https://cesusub.sbxm.eu.org
 - Sub-Store 前端地址：https://sub_store_for_subs_check.sbxm.eu.org

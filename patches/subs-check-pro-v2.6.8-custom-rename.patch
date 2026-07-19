@@ -1,0 +1,300 @@
+diff --git a/check/check.go b/check/check.go
+index e9843ed..0267c01 100644
+--- a/check/check.go
++++ b/check/check.go
+@@ -1047,16 +1047,22 @@ func checkOnePlatform(job *ProxyJob, plat string, mediaClient *http.Client, db *
+ func (pc *ProxyChecker) updateProxyName(res *Result, httpClient *ProxyClient, speed int, db *maxminddb.Reader, cfLoc string, cfIP string, jctx context.Context) {
+ 	// 以节点IP查询位置重命名（如果开启）
+ 	if config.GlobalConfig.RenameNode {
++		originName, _ := res.Proxy["name"].(string)
+ 		if res.Country == "" {
+ 			country, _, countryCodeTag, _ := proxyutils.GetProxyCountry(httpClient.Client, db, jctx, cfLoc, cfIP)
+ 			res.Country = country
+ 			res.CountryCodeTag = countryCodeTag
+ 		}
+ 		if res.Country != "" {
+-			res.Proxy["name"] = config.GlobalConfig.NodePrefix + proxyutils.Rename(res.Country, res.CountryCodeTag)
++			res.Proxy["name"] = config.GlobalConfig.NodePrefix + proxyutils.Rename(res.Country, res.CountryCodeTag, originName)
+ 		} else {
+-			originName := res.Proxy["name"].(string)
+-			res.Proxy["name"] = config.GlobalConfig.NodePrefix + proxyutils.Rename(res.Country, res.CountryCodeTag) + originName
++			// IP 归属查询失败时，尝试从原名中的国旗、国家代码或国家名称恢复地区。
++			if inferredCode := proxyutils.InferCountryCode(originName); inferredCode != "" {
++				res.Proxy["name"] = config.GlobalConfig.NodePrefix + proxyutils.Rename(inferredCode, inferredCode, originName)
++			} else {
++				// 原名也没有可靠的国家信息时保留原名，避免错误归类。
++				res.Proxy["name"] = config.GlobalConfig.NodePrefix + originName
++			}
+ 		}
+ 	}
+ 
+diff --git a/proxy/rename.go b/proxy/rename.go
+index 51559e8..59ff10e 100644
+--- a/proxy/rename.go
++++ b/proxy/rename.go
+@@ -1,18 +1,23 @@
+ package proxies
+ 
+ import (
++	"regexp"
+ 	"strconv"
++	"strings"
+ 	"sync"
+ 
+ 	"github.com/sinspired/subs-check-pro/v2/config"
++	"golang.org/x/text/language"
++	"golang.org/x/text/language/display"
+ )
+ 
+ var (
+-	counter     = make(map[string]int)
+-	counterLock = sync.Mutex{}
++	counter      = make(map[string]int)
++	counterLock  = sync.Mutex{}
++	multiplierRE = regexp.MustCompile(`(?i)(?:^|[\s|/_-])(?:(\d+(?:\.\d+)?)\s*[x×倍]|[x×]\s*(\d+(?:\.\d+)?))(?:$|[\s|/_-])`)
+ )
+ 
+-func Rename(name, countryCodeTag string) string {
++func Rename(name, countryCodeTag, originName string) string {
+ 	flag := CountryCodeToFlag(name)
+ 
+ 	key, label := name, name
+@@ -28,10 +33,166 @@ func Rename(name, countryCodeTag string) string {
+ 
+ 	counterLock.Lock()
+ 	counter[key]++
+ 	n := counter[key]
+ 	counterLock.Unlock()
+ 
+-	return flag + label + "_" + strconv.Itoa(n)
++	sequence := strconv.Itoa(n)
++	if n < 10 {
++		sequence = "0" + sequence
++	}
++
++	newName := flag + " " + countryNameZH(label) + " " + sequence
++	if multiplier := extractMultiplier(originName); multiplier != "" {
++		newName += " | " + multiplier
++	}
++	return newName
++}
++
++func countryNameZH(code string) string {
++	upperCode := strings.ToUpper(code)
++	if len(upperCode) >= 2 {
++		upperCode = upperCode[:2]
++	}
++
++	// CLDR uses long administrative names for these regions. Short names are
++	// easier to scan in proxy clients and match the user's requested format.
++	if shortName, ok := map[string]string{
++		"HK": "香港",
++		"MO": "澳门",
++		"TW": "台湾",
++	}[upperCode]; ok {
++		return shortName
++	}
++
++	region, err := language.ParseRegion(upperCode)
++	if err == nil {
++		if localized := display.Regions(language.SimplifiedChinese).Name(region); localized != "" {
++			return localized
++		}
++	}
++	if code != "" {
++		return code
++	}
++	return "未知"
++}
++
++// InferCountryCode extracts a reliable ISO alpha-2 country code from the
++// original node name when IP geolocation is unavailable.
++func InferCountryCode(name string) string {
++	if code := countryCodeFromFlag(name); isCountryCode(code) {
++		return code
++	}
++	if code := leadingCountryCode(name); isCountryCode(code) {
++		return code
++	}
++
++	lowerName := strings.ToLower(name)
++	bestCode, bestMatch := "", ""
++	for first := byte('A'); first <= byte('Z'); first++ {
++		for second := byte('A'); second <= byte('Z'); second++ {
++			code := string([]byte{first, second})
++			if !isCountryCode(code) {
++				continue
++			}
++			region, _ := language.ParseRegion(code)
++
++			chineseName := countryNameZH(code)
++			if chineseName != "" && chineseName != "未知" && strings.Contains(name, chineseName) && len(chineseName) > len(bestMatch) {
++				bestCode, bestMatch = code, chineseName
++			}
++
++			englishName := strings.ToLower(display.Regions(language.English).Name(region))
++			if containsASCIIToken(lowerName, englishName) && len(englishName) > len(bestMatch) {
++				bestCode, bestMatch = code, englishName
++			}
++		}
++	}
++	return bestCode
++}
++
++func countryCodeFromFlag(name string) string {
++	runes := []rune(name)
++	const regionalIndicatorA = rune(0x1F1E6)
++	const regionalIndicatorZ = rune(0x1F1FF)
++	for index := 0; index+1 < len(runes); index++ {
++		first, second := runes[index], runes[index+1]
++		if first < regionalIndicatorA || first > regionalIndicatorZ || second < regionalIndicatorA || second > regionalIndicatorZ {
++			continue
++		}
++		return string([]byte{
++			byte('A' + first - regionalIndicatorA),
++			byte('A' + second - regionalIndicatorA),
++		})
++	}
++	return ""
++}
++
++func leadingCountryCode(name string) string {
++	for index := 0; index < len(name); index++ {
++		current := name[index]
++		if current >= 'a' && current <= 'z' {
++			return ""
++		}
++		if current < 'A' || current > 'Z' {
++			continue
++		}
++		if index+1 >= len(name) || name[index+1] < 'A' || name[index+1] > 'Z' {
++			return ""
++		}
++		if index+2 < len(name) && isASCIILetter(name[index+2]) {
++			return ""
++		}
++		return name[index : index+2]
++	}
++	return ""
++}
++
++func isCountryCode(code string) bool {
++	if len(code) != 2 || code == "XX" {
++		return false
++	}
++	region, err := language.ParseRegion(code)
++	return err == nil && region.String() != "ZZ"
++}
++
++func containsASCIIToken(text, token string) bool {
++	if token == "" {
++		return false
++	}
++	for offset := 0; offset < len(text); {
++		relative := strings.Index(text[offset:], token)
++		if relative < 0 {
++			return false
++		}
++		start := offset + relative
++		end := start + len(token)
++		if (start == 0 || !isASCIILetter(text[start-1])) && (end == len(text) || !isASCIILetter(text[end])) {
++			return true
++		}
++		offset = start + 1
++	}
++	return false
++}
++
++func isASCIILetter(value byte) bool {
++	return value >= 'A' && value <= 'Z' || value >= 'a' && value <= 'z'
++}
++
++func extractMultiplier(name string) string {
++	match := multiplierRE.FindStringSubmatch(name)
++	if len(match) == 0 {
++		return ""
++	}
++
++	value := match[1]
++	if value == "" {
++		value = match[2]
++	}
++	parsed, err := strconv.ParseFloat(value, 64)
++	if err != nil || parsed <= 0 {
++		return ""
++	}
++	return strconv.FormatFloat(parsed, 'f', -1, 64) + "x"
+ }
+ 
+ // ResetRenameCounter 将所有计数器重置为 0
+diff --git a/proxy/rename_test.go b/proxy/rename_test.go
+new file mode 100644
+index 0000000..f2327fb
+--- /dev/null
++++ b/proxy/rename_test.go
+@@ -0,0 +1,65 @@
++package proxies
++
++import "testing"
++
++func TestRenameChineseCountryWithPaddedCounterAndMultiplier(t *testing.T) {
++	ResetRenameCounter()
++
++	tests := []struct {
++		country string
++		origin  string
++		want    string
++	}{
++		{"HK", "香港节点 | 1x", "🇭🇰 香港 01 | 1x"},
++		{"HK", "香港节点_0.5X_专线", "🇭🇰 香港 02 | 0.5x"},
++		{"HK", "香港节点 2倍", "🇭🇰 香港 03 | 2x"},
++		{"HK", "香港节点", "🇭🇰 香港 04"},
++		{"US", "US node | × 3", "🇺🇸 美国 01 | 3x"},
++	}
++
++	for _, test := range tests {
++		if got := Rename(test.country, "", test.origin); got != test.want {
++			t.Fatalf("Rename(%q, %q) = %q, want %q", test.country, test.origin, got, test.want)
++		}
++	}
++}
++
++func TestInferCountryCodeFromOriginalName(t *testing.T) {
++	tests := []struct {
++		name string
++		want string
++	}{
++		{"🇺🇸US_1567|10.8MB/s|B007-260618 01", "US"},
++		{"荷兰+V2CROSS.COM", "NL"},
++		{"🇳🇱NL_12", "NL"},
++		{"United States premium node", "US"},
++		{"4Sarina-10638", ""},
++		{"🆔capoit 🔒 VL-WS-N/A ❔ XX 17ms", ""},
++	}
++
++	for _, test := range tests {
++		if got := InferCountryCode(test.name); got != test.want {
++			t.Fatalf("InferCountryCode(%q) = %q, want %q", test.name, got, test.want)
++		}
++	}
++}
++
++func TestExtractMultiplierIgnoresZero(t *testing.T) {
++	tests := []struct {
++		name string
++		want string
++	}{
++		{"node | 0x", ""},
++		{"node_0.0X_backup", ""},
++		{"node × 0", ""},
++		{"node | 0.1x", "0.1x"},
++		{"node | 01x", "1x"},
++		{"node | 00.10X", "0.1x"},
++	}
++
++	for _, test := range tests {
++		if got := extractMultiplier(test.name); got != test.want {
++			t.Fatalf("extractMultiplier(%q) = %q, want %q", test.name, got, test.want)
++		}
++	}
++}

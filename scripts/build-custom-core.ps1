@@ -3,10 +3,12 @@ param()
 
 $ErrorActionPreference = 'Stop'
 $workspace = Split-Path -Parent $PSScriptRoot
-$patch = Join-Path $workspace 'patches\subs-check-pro-v2.6.7-custom-rename.patch'
-$destination = Join-Path $workspace 'runtime\bin\subs-check-pro-custom-v2.6.7.exe'
+$upstreamVersion = 'v2.6.8'
+$upstreamCommit = '5fe3a39'
+$patch = Join-Path $workspace 'patches\subs-check-pro-v2.6.8-custom-rename.patch'
+$destination = Join-Path $workspace 'runtime\bin\subs-check-pro-custom-v2.6.8.exe'
 $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
-$buildDir = Join-Path $tempRoot ('subs-check-pro-v2.6.7-' + [guid]::NewGuid().ToString('N'))
+$buildDir = Join-Path $tempRoot ('subs-check-pro-v2.6.8-' + [guid]::NewGuid().ToString('N'))
 $buildDir = [IO.Path]::GetFullPath($buildDir)
 
 if (-not $buildDir.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase)) {
@@ -17,7 +19,7 @@ if (-not (Test-Path -LiteralPath $patch -PathType Leaf)) {
 }
 
 try {
-    & git clone --branch v2.6.7 --depth 1 `
+    & git clone --branch $upstreamVersion --depth 1 `
         https://github.com/sinspired/subs-check-pro.git $buildDir
     if ($LASTEXITCODE -ne 0) { throw 'git clone failed' }
 
@@ -47,7 +49,7 @@ try {
 
         $built = Join-Path $buildDir 'subs-check-pro-custom.exe'
         & go build -trimpath `
-            -ldflags '-s -w -X main.Version=v2.6.7-custom-rename -X main.CurrentCommit=e0af4f2-custom' `
+            -ldflags ("-s -w -X main.Version=$upstreamVersion+custom.rename -X main.CurrentCommit=$upstreamCommit-custom") `
             -o $built .
         if ($LASTEXITCODE -ne 0) { throw 'go build failed' }
 

@@ -15,7 +15,7 @@ $lockPath = Join-Path $runtime 'subs-check-pro.lock'
 $env:LOG_LEVEL = 'info'
 $script:mainLogOffsets = @{}
 
-# v2.6.7 rejects a host-qualified sub-store-port even though its runtime
+# v2.6.x rejects a host-qualified sub-store-port even though its runtime
 # supports one. Pass only the numeric port in YAML and force the embedded
 # Sub-Store backend to remain on loopback through its supported environment.
 $env:SUB_STORE_BACKEND_API_HOST = '127.0.0.1'
