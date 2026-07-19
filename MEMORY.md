@@ -6,6 +6,7 @@
 - 初始化日期：2026-07-17
 - 技术栈：Windows 10、PowerShell 5.1、Go 二进制、Cloudflare Tunnel
 - 项目用途：在常开 Windows 电脑上运行 subs-check-pro，通过手机远程添加订阅、发起测速并查看结果
+- 当前工作区根目录：`F:\codex\subscheck`；2026-07-19 已从旧的 C 盘 Codex 日期目录迁移，运行配置、自启动和服务路径统一以此为准。
 
 ## 架构决策
 
@@ -48,5 +49,6 @@
 - API Key 存放于 `runtime/config/config.yaml`，这里只记录位置，不记录值。
 - Sub-Store 私有后端路径同样存放于 `runtime/config/config.yaml`，这里只记录位置，不记录值。
 - 程序日志存放于 `runtime/logs/`。
+- 对话中仍可取得的附件统一存放于 `private/conversation-assets/`，该目录被 Git 忽略，不上传 GitHub。
 
 > 凭据只记录存放位置，不记录具体值；代码中可直接查到的信息不重复记录。

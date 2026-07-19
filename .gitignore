@@ -11,6 +11,9 @@ runtime/cloudflared/credentials.json
 runtime/cloudflared/cert.pem
 runtime/cloudflared/*.log
 
+# Private conversation attachments and local diagnostics
+private/
+
 # Local editor and OS files
 .DS_Store
 Thumbs.db
