@@ -2,8 +2,27 @@ diff --git a/check/check.go b/check/check.go
 index e9843ed..0267c01 100644
 --- a/check/check.go
 +++ b/check/check.go
-@@ -1047,16 +1047,22 @@ func checkOnePlatform(job *ProxyJob, plat string, mediaClient *http.Client, db *
- func (pc *ProxyChecker) updateProxyName(res *Result, httpClient *ProxyClient, speed int, db *maxminddb.Reader, cfLoc string, cfIP string, jctx context.Context) {
+@@ -797,7 +797,16 @@ func (pc *ProxyChecker) Check(httpClient *http.Client, speedON, mediaON bool, db
+ 					mediaCheck(job, db, ctx)
+ 				}
+ 
+-				pc.updateProxyName(&job.Result, job.Client, job.Speed, db, job.CfLoc, job.CfIP, ctx)
++				if !pc.updateProxyName(&job.Result, job.Client, job.Speed, db, job.CfLoc, job.CfIP, ctx) {
++					// 此节点此前已在 alive/speed 阶段计入可用数，剔除时同步回退。
++					pc.available.Add(-1)
++					Available.Add(^uint32(0))
++					if job.mediaMarked.CompareAndSwap(false, true) {
++						pc.pt.CountMedia()
++					}
++					job.Close()
++					continue
++				}
+ 
+ 				// 将结果发送到 collector
+ 				pc.resultChan <- job.Result
+@@ -1047,16 +1056,24 @@ func checkOnePlatform(job *ProxyJob, plat string, mediaClient *http.Client, db *
+-func (pc *ProxyChecker) updateProxyName(res *Result, httpClient *ProxyClient, speed int, db *maxminddb.Reader, cfLoc string, cfIP string, jctx context.Context) {
++func (pc *ProxyChecker) updateProxyName(res *Result, httpClient *ProxyClient, speed int, db *maxminddb.Reader, cfLoc string, cfIP string, jctx context.Context) bool {
  	// 以节点IP查询位置重命名（如果开启）
  	if config.GlobalConfig.RenameNode {
 +		originName, _ := res.Proxy["name"].(string)
@@ -20,19 +39,31 @@ index e9843ed..0267c01 100644
 -			res.Proxy["name"] = config.GlobalConfig.NodePrefix + proxyutils.Rename(res.Country, res.CountryCodeTag) + originName
 +			// IP 归属查询失败时，尝试从原名中的国旗、国家代码或国家名称恢复地区。
 +			if inferredCode := proxyutils.InferCountryCode(originName); inferredCode != "" {
++				res.Country = inferredCode
++				res.CountryCodeTag = inferredCode
 +				res.Proxy["name"] = config.GlobalConfig.NodePrefix + proxyutils.Rename(inferredCode, inferredCode, originName)
 +			} else {
-+				// 原名也没有可靠的国家信息时保留原名，避免错误归类。
-+				res.Proxy["name"] = config.GlobalConfig.NodePrefix + originName
++				// 无可靠国家信息的节点不进入最终结果，避免混入非标准名称。
++				return false
 +			}
  		}
  	}
  
+@@ -1183,7 +1200,8 @@ func (pc *ProxyChecker) updateProxyName(res *Result, httpClient *ProxyClient, spe
+ 	// 将所有标记添加到名称中
+ 	if len(tags) > 0 {
+ 		name += "|" + strings.Join(tags, "|")
+ 	}
+ 
+ 	res.Proxy["name"] = name
++	return true
+ }
+
 diff --git a/proxy/rename.go b/proxy/rename.go
 index 51559e8..59ff10e 100644
 --- a/proxy/rename.go
 +++ b/proxy/rename.go
-@@ -1,18 +1,23 @@
+@@ -1,18 +1,24 @@
  package proxies
  
  import (
@@ -51,6 +82,7 @@ index 51559e8..59ff10e 100644
 -	counterLock = sync.Mutex{}
 +	counter      = make(map[string]int)
 +	counterLock  = sync.Mutex{}
++	delimitedCountryCodeRE = regexp.MustCompile(`::([A-Z]{2})(?:$|[^A-Za-z])`)
 +	multiplierRE = regexp.MustCompile(`(?i)(?:^|[\s|/_-])(?:(\d+(?:\.\d+)?)\s*[x×倍]|[x×]\s*(\d+(?:\.\d+)?))(?:$|[\s|/_-])`)
  )
  
@@ -59,7 +91,7 @@ index 51559e8..59ff10e 100644
  	flag := CountryCodeToFlag(name)
  
  	key, label := name, name
-@@ -28,10 +33,166 @@ func Rename(name, countryCodeTag string) string {
+@@ -28,10 +34,169 @@ func Rename(name, countryCodeTag string) string {
  
  	counterLock.Lock()
  	counter[key]++
@@ -115,6 +147,9 @@ index 51559e8..59ff10e 100644
 +	}
 +	if code := leadingCountryCode(name); isCountryCode(code) {
 +		return code
++	}
++	if match := delimitedCountryCodeRE.FindStringSubmatch(name); len(match) > 1 && isCountryCode(match[1]) {
++		return match[1]
 +	}
 +
 +	lowerName := strings.ToLower(name)
@@ -232,7 +267,7 @@ new file mode 100644
 index 0000000..f2327fb
 --- /dev/null
 +++ b/proxy/rename_test.go
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,71 @@
 +package proxies
 +
 +import "testing"
@@ -268,6 +303,12 @@ index 0000000..f2327fb
 +		{"荷兰+V2CROSS.COM", "NL"},
 +		{"🇳🇱NL_12", "NL"},
 +		{"United States premium node", "US"},
++		{">>@oneclickvpnkeys::US (67)", "US"},
++		{">>@oneclickvpnkeys::US-23", "US"},
++		{"provider::XX-23", ""},
++		{"provider::USA-23", ""},
++		{"provider::USfoo", ""},
++		{"provider::us-23", ""},
 +		{"4Sarina-10638", ""},
 +		{"🆔capoit 🔒 VL-WS-N/A ❔ XX 17ms", ""},
 +	}

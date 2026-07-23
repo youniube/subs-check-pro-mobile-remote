@@ -16,8 +16,11 @@
 - 使用当前用户启动项运行 subs-check-pro 和 cloudflared，避免管理员权限与现场 UAC；用户登录后自动启动。
 - cloudflared 固定使用 IPv4 边缘地址与 HTTP/2；原因是本机到 Cloudflare 的 IPv6 `7844` 端口超时，而 IPv4 HTTP/2 链路可稳定建立。
 - 已启用内置 Sub-Store；后端只监听 `127.0.0.1:8299`，并通过 Cloudflare Tunnel 的保留子域提供手机端前端和带私有路径的后端访问。
-- 核心基于官方 v2.6.8 应用了自定义节点重命名补丁：格式为 `🇭🇰 香港 01 | 1x`，地区内编号补齐两位，只保留原名中大于 0 的倍率（忽略 `0x` 等无效倍率），并按数值规范化前导零（`01x` → `1x`、`00.10x` → `0.1x`）。IP 归属查询失败时，继续从原名中的国旗、开头国家代码、中文或英文国家名推断地区；能识别就重命名，无法可靠识别才保留原名。补丁位于 `patches/subs-check-pro-v2.6.8-custom-rename.patch`，复现脚本位于 `scripts/build-custom-core.ps1`，官方二进制备份位于 `runtime/bin/subs-check-pro-official-v2.6.8.exe`。自定义版本使用 SemVer 构建元数据 `v2.6.8+custom.rename`，避免把同基线补丁误判为低于官方正式版。
+- 核心基于官方 v2.6.8 应用了自定义节点重命名补丁：格式为 `🇭🇰 香港 01 | 1x`，地区内编号补齐两位，只保留原名中大于 0 的倍率（忽略 `0x` 等无效倍率），并按数值规范化前导零（`01x` → `1x`、`00.10x` → `0.1x`）。IP 归属查询失败时，继续从原名中的国旗、开头国家代码、明确分隔符后的国家代码（如 `::US`）、中文或英文国家名推断地区；能识别就重命名，仍无法可靠识别的节点从最终结果中删除。补丁位于 `patches/subs-check-pro-v2.6.8-custom-rename.patch`，复现脚本位于 `scripts/build-custom-core.ps1`，官方二进制备份位于 `runtime/bin/subs-check-pro-official-v2.6.8.exe`。自定义版本使用 SemVer 构建元数据 `v2.6.8+custom.history.ua2.loopback1`，避免把同基线补丁误判为低于官方正式版，并明确当前核心包含跨次分析、第二版 UA 兼容与历史节点回环复检修复。
 - 为避免官方升级覆盖自定义核心，核心自动更新已关闭；升级前需要把重命名补丁迁移到目标版本、运行相关 Go 测试并重新构建。
+- 已修复官方 v2.6.8 分析报告在检测前过早清空逐订阅统计的问题：核心不再把活跃订阅写成 `成功数/0`，没有产出节点的来源会进入沉默订阅；WebUI 的“含沉默订阅”会显示数量，勾选后展开沉默列表并更新标题，同时影响复制范围。报告新增跨次订阅健康历史：只有完整检测才累计，连续 3 次没有节点通过才标记“建议核查/删除”，任意一次通过即清零，中止或因成功数上限提前结束不累计；只给人工建议，不自动删除。历史保存在 `runtime/output/stats/subs-health-history.yaml`，并区分 `0/0`（无可测节点）和 `0/N`（节点全部未通过）。核心补丁为 `patches/subs-check-pro-v2.6.8-analysis-report.patch` 与 `patches/subs-check-pro-v2.6.8-subscription-history.patch`，WebUI 补丁为对应的两个 `subs-check-pro-webui-b8db5f51c367-*.patch`。
+- `scripts/build-custom-core.ps1` 使用 Git partial clone + sparse checkout，只下载 Windows amd64 所需的内嵌 Node 资产；原因是上游仓库包含约 300 MB 的多平台二进制，对当前 Windows 构建无用。用户影响是完整构建由数分钟缩短到约 40 秒，产物功能不变。
+- 普通订阅首轮没有产生结构有效节点时，核心会按 `clash.meta`、Clash Meta Android、`sing-box` 的顺序做 UA 兼容重拉，得到结构有效节点后立即停止；结构计数发生在 `node-type` 过滤前，所以正常订阅和仅被用户类型过滤的订阅仍只请求一次，GitHub Raw 跳过兼容重拉。补丁位于 `patches/subs-check-pro-v2.6.8-ua-fallback.patch`，回归测试覆盖“HTML 产生畸形假候选 → Clash YAML”恢复、首个兼容 UA 仍无有效节点时继续、正常首轮不重试、类型过滤不重拉和 GitHub 跳过。
 
 ## 已知问题与踩坑
 
@@ -32,6 +35,11 @@
 - 2026-07-19 迁移时发现手机配置曾把 `sub-store-port` 漂移到 `9299`，而 Tunnel 仍转发 `8299`；现已统一恢复 `8299`，`scripts/verify.ps1` 会把端口不一致视为失败。
 - `sub-urls-remote` 只接收“远程订阅链接清单”的地址，不接收普通机场订阅；普通订阅误放其中时，单行响应超过 64 KiB 会触发 `bufio.Scanner: token too long`，应放入 `sub-urls` 或 Sub-Store。
 - 当前这条机场订阅返回约 803 个 VLESS URI，但使用 `%0A` 字面量分隔而不是真实换行；移入 `sub-urls` 后下载成功但主程序和 Sub-Store 都只能解析出至多一个无效节点。若机场端无法改格式，需要增加仅本机监听的自动规范化适配器。
+- 分析报告补丁不会追溯重算 `runtime/output/stats/subs-analysis.yaml`，跨次历史也不会根据旧报告反推；部署后必须完成一次新的完整节点检测才会生成正确单次数据并从连续次数 1 开始累计。
+- 上游 v2.6.8 首选 `mihomo/1.19.27` 且会把不可解析正文的 HTTP 200 当成成功，曾造成假 `0/0`。第一版 UA 修复错误地用解析器原始候选数触发回退；`clash.156987.xyz` 返回的 HTML 会因 Cloudflare 脚本被宽松解析器误报 1 个畸形候选，但结构有效数为 0，导致回退未执行。第二版改用类型过滤前、通过 `server`/`port`/`type` 校验的结构有效数触发；2026-07-20 直连验收中 `clash.meta` 响应解析出 52 个结构有效候选、订阅内去重后 31 个节点，同日完整检测最终为 `21/31`，连续沉默清零并恢复 active。不能把所有剩余 `0/0` 都归因于 UA，失效链接、空文件和确实无受支持节点的来源仍会保持 `0/0`。
+- 2026-07-23 评估上游 v2.6.9：核心唯一业务修复是删除 `ClearCache` 中过早清空 `SubStats` 的语句，解决“订阅链接总数为 0”，但上游也因此不再在检测前后重置该映射，连续检测可能累积旧统计；本项目现有分析报告补丁已用“拉取缓存清理/完整状态清理”分离的方式更完整地解决。实测迁移到 v2.6.9 时，重命名、跨次历史、UA 回退、回环历史 4 个核心补丁可直接应用，分析报告核心补丁因同一行被上游删除而需手工适配；2 个 WebUI 补丁可直接应用到新版 WebUI。该版本主要新增手机触摸提示、小屏比例条修复、Sub-Store 2.36.18/前端 2.29.3 和依赖更新，属于有用但不紧急的升级。
+- Git partial clone 的 `-c http.sslBackend=openssl` 只影响 clone 命令，不会自动传给后续 sparse checkout 的 promisor fetch；构建脚本现在会在临时仓库中持久设置 OpenSSL backend，避免 Windows PowerShell 无交互环境再次落回 schannel 并报凭据错误。
+- `keep-success-proxies: true` 会自动把已有的 `runtime/output/sub/all.yaml` 与 `history.yaml` 作为内部订阅重新检测，用户无需手工添加。上游 v2.6.8 只兼容纯端口或 `:端口`，却把本项目用于限制回环监听的 `listen-port: "127.0.0.1:8199"` 直接拼到 `http://127.0.0.1:` 后，生成非法的重复主机名 URL。现已通过 `patches/subs-check-pro-v2.6.8-loopback-history.patch` 统一提取 WebUI 与 Sub-Store 的数值端口，并固定用 IPv4 回环生成内部 URL；这既恢复上次成功与历史节点复检及其优先级标记，也保持 WebUI 只监听回环地址。
 
 ## 用户纠正与偏好
 
@@ -40,7 +48,9 @@
 - 用户将最终访问域名从已有记录的 `cesu.sbxm.eu.org` 改为 `cesusub.sbxm.eu.org`。
 - 用户选择使用较短的自定义 API Key；公网入口存在弱口令风险，后续应优先改用强密钥或增加 Cloudflare Access。
 - 默认中文说明，技术决策需要解释原因和对用户的影响。
-- 归属查询失败的节点不能一律标成“未知”；原名含国家国旗、代码或中英文国家名时，应先据此重命名，确实没有可靠国家信息时才保留原名。
+- 归属查询失败的节点不能一律标成“未知”；原名含国家国旗、开头或明确分隔符后的有效国家代码、或中英文国家名时，应先据此重命名；确实没有可靠国家信息时，从最终结果中删除，不再保留原名。
+- 用户希望分析报告用于决定是否清理订阅：不能凭一次沉默下结论，应以多次完整检测的连续沉默趋势提供人工删除建议。
+- 用户会用 Clash Meta UA 交叉验证 `0/0` 订阅；分析报告应尽量区分真实空订阅与 UA/响应格式造成的假 `0/0`。
 
 ## 外部资源位置
 

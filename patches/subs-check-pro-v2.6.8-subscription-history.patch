@@ -1,0 +1,316 @@
+diff --git a/check/analysis_stats.go b/check/analysis_stats.go
+index a9b79de..0e4b158 100644
+--- a/check/analysis_stats.go
++++ b/check/analysis_stats.go
+@@ -189,6 +189,9 @@ func (pc *ProxyChecker) GenerateAnalysisReport() {
+ 		return cmpFloat(rateB, rateA)
+ 	})
+ 
++	// Only completed runs advance the cross-run subscription health history.
++	updateSubscriptionHealthHistory(sortedURLs)
++
+ 	// 并保存订阅成功率统计并打印成功率过低日志
+ 	checkSubsSuccessRate(subAnalysis, sortedURLs)
+ 	// 保存深度分析报告
+@@ -272,6 +275,8 @@ func saveDetailedAnalysis(global *AnalysisStats, subs map[string]*AnalysisStats,
+ 	sb.WriteString("      blocked_⁻¹:");sb.WriteString(formatMap(global.CFBlock, "        "));sb.WriteString("\n")
+ 	sb.WriteString("    vps_details_²:");sb.WriteString(formatMap(global.NonCF, "      "));sb.WriteString("\n")
+ 
++	appendSubscriptionHealthSummary(&sb, sortedURLs)
++
+ 	// 3. 订阅排行与明细
+ 	sb.WriteString("\nsubs_ranking:\n")
+ 
+@@ -285,11 +290,13 @@ func saveDetailedAnalysis(global *AnalysisStats, subs map[string]*AnalysisStats,
+ 		if st != nil {
+ 			sb.WriteString("  - url: ");sb.WriteString(u);sb.WriteString("\n")
+ 			sb.WriteString("    stats: { rate: ");sb.WriteString(strconv.FormatFloat(rate*100, 'f', 4, 64));sb.WriteString("%, success: ");sb.WriteString(strconv.Itoa(pStat.Success));sb.WriteString(", total: ");sb.WriteString(strconv.Itoa(pStat.Total));sb.WriteString(" }\n")
++			appendSubscriptionHealthDetails(&sb, u)
+ 			sb.WriteString("    protocols: { ");sb.WriteString(formatMapToInline(st.Types));sb.WriteString(" }\n")
+ 			sb.WriteString("    top_locations: [");sb.WriteString(getTopKeys(st.Countries, 3));sb.WriteString("]\n")
+ 		} else {
+ 			sbBad.WriteString("  - url: ");sbBad.WriteString(u);sbBad.WriteString("\n")
+ 			sbBad.WriteString("    stats: { rate: ");sbBad.WriteString(strconv.FormatFloat(rate*100, 'f', 4, 64));sbBad.WriteString("%, success: ");sbBad.WriteString(strconv.Itoa(pStat.Success));sbBad.WriteString(", total: ");sbBad.WriteString(strconv.Itoa(pStat.Total));sbBad.WriteString(" }\n")
++			appendSubscriptionHealthDetails(&sbBad, u)
+ 		}
+ 	}
+ 
+diff --git a/check/subscription_history.go b/check/subscription_history.go
+new file mode 100644
+index 0000000..0c5d7ad
+--- /dev/null
++++ b/check/subscription_history.go
+@@ -0,0 +1,192 @@
++package check
++
++import (
++	"fmt"
++	"log/slog"
++	"os"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"time"
++
++	"github.com/goccy/go-yaml"
++	proxyutils "github.com/sinspired/subs-check-pro/v2/proxy"
++	"github.com/sinspired/subs-check-pro/v2/save/method"
++)
++
++const (
++	subscriptionHealthHistoryFilename = "subs-health-history.yaml"
++	subscriptionDeleteThreshold       = 3
++)
++
++type subscriptionHealthHistory struct {
++	Version       int                                 `yaml:"version"`
++	CompletedRuns int                                 `yaml:"completed_runs"`
++	UpdatedAt     string                              `yaml:"updated_at,omitempty"`
++	Subscriptions map[string]subscriptionHealthRecord `yaml:"subscriptions"`
++}
++
++type subscriptionHealthRecord struct {
++	ObservedRuns      int    `yaml:"observed_runs"`
++	ConsecutiveSilent int    `yaml:"consecutive_silent"`
++	LastStatus        string `yaml:"last_status"`
++	LastCheckedAt     string `yaml:"last_checked_at,omitempty"`
++	LastSuccessAt     string `yaml:"last_success_at,omitempty"`
++	LastSilentAt      string `yaml:"last_silent_at,omitempty"`
++	LastSuccess       int    `yaml:"last_success"`
++	LastTotal         int    `yaml:"last_total"`
++}
++
++type subscriptionRunResult struct {
++	Success int
++	Total   int
++}
++
++var (
++	currentSubscriptionHealthHistory = newSubscriptionHealthHistory()
++	currentSubscriptionRunCounted     bool
++)
++
++func newSubscriptionHealthHistory() *subscriptionHealthHistory {
++	return &subscriptionHealthHistory{
++		Version:       1,
++		Subscriptions: make(map[string]subscriptionHealthRecord),
++	}
++}
++
++func subscriptionHistoryRunComplete() bool {
++	return !ForceClose.Load() && !Successlimited.Load()
++}
++
++func updateSubscriptionHealthHistory(sortedURLs []string) {
++	history, err := loadSubscriptionHealthHistory()
++	if err != nil {
++		// Resetting is safer than preserving a possibly misleading delete suggestion.
++		slog.Warn("订阅健康历史读取失败，本次从空历史重新累计", "错误", err)
++		history = newSubscriptionHealthHistory()
++	}
++
++	results := make(map[string]subscriptionRunResult, len(sortedURLs))
++	for _, subURL := range sortedURLs {
++		stat := proxyutils.SubStats[subURL]
++		results[subURL] = subscriptionRunResult{Success: stat.Success, Total: stat.Total}
++	}
++
++	checkedAt := CheckEndTime
++	if checkedAt.IsZero() {
++		checkedAt = time.Now()
++	}
++	counted := subscriptionHistoryRunComplete()
++	applySubscriptionHealthRun(history, sortedURLs, results, checkedAt, counted)
++
++	currentSubscriptionHealthHistory = history
++	currentSubscriptionRunCounted = counted
++	if !counted {
++		slog.Info("本次检测未完整完成，订阅连续沉默次数不累计")
++		return
++	}
++
++	data, err := yaml.Marshal(history)
++	if err != nil {
++		slog.Warn("订阅健康历史编码失败", "错误", err)
++		return
++	}
++	if err := method.SaveToStats(data, subscriptionHealthHistoryFilename, "订阅健康历史已更新"); err != nil {
++		slog.Warn("订阅健康历史保存失败", "错误", err)
++	}
++}
++
++func loadSubscriptionHealthHistory() (*subscriptionHealthHistory, error) {
++	saver, err := method.NewStatsSaver()
++	if err != nil {
++		return nil, err
++	}
++	data, err := os.ReadFile(filepath.Join(saver.StatsPath, subscriptionHealthHistoryFilename))
++	if os.IsNotExist(err) {
++		return newSubscriptionHealthHistory(), nil
++	}
++	if err != nil {
++		return nil, err
++	}
++
++	history := newSubscriptionHealthHistory()
++	if err := yaml.Unmarshal(data, history); err != nil {
++		return nil, err
++	}
++	if history.Subscriptions == nil {
++		history.Subscriptions = make(map[string]subscriptionHealthRecord)
++	}
++	if history.Version == 0 {
++		history.Version = 1
++	}
++	return history, nil
++}
++
++func applySubscriptionHealthRun(
++	history *subscriptionHealthHistory,
++	sortedURLs []string,
++	results map[string]subscriptionRunResult,
++	checkedAt time.Time,
++	counted bool,
++) {
++	if !counted {
++		return
++	}
++	if history.Subscriptions == nil {
++		history.Subscriptions = make(map[string]subscriptionHealthRecord)
++	}
++
++	timestamp := checkedAt.Format(time.RFC3339)
++	history.Version = 1
++	history.CompletedRuns++
++	history.UpdatedAt = timestamp
++	for _, subURL := range sortedURLs {
++		result := results[subURL]
++		record := history.Subscriptions[subURL]
++		record.ObservedRuns++
++		record.LastCheckedAt = timestamp
++		record.LastSuccess = result.Success
++		record.LastTotal = result.Total
++		if result.Success > 0 {
++			record.ConsecutiveSilent = 0
++			record.LastStatus = "active"
++			record.LastSuccessAt = timestamp
++		} else {
++			record.ConsecutiveSilent++
++			record.LastStatus = "silent"
++			record.LastSilentAt = timestamp
++		}
++		history.Subscriptions[subURL] = record
++	}
++}
++
++func subscriptionDeleteSuggested(record subscriptionHealthRecord) bool {
++	return record.LastStatus == "silent" && record.ConsecutiveSilent >= subscriptionDeleteThreshold
++}
++
++func appendSubscriptionHealthSummary(sb *strings.Builder, sortedURLs []string) {
++	suggested := 0
++	for _, subURL := range sortedURLs {
++		if subscriptionDeleteSuggested(currentSubscriptionHealthHistory.Subscriptions[subURL]) {
++			suggested++
++		}
++	}
++	fmt.Fprintf(sb, "\nsubscription_history:\n")
++	fmt.Fprintf(sb, "  run_counted: %t\n", currentSubscriptionRunCounted)
++	fmt.Fprintf(sb, "  completed_runs: %d\n", currentSubscriptionHealthHistory.CompletedRuns)
++	fmt.Fprintf(sb, "  delete_suggestion_threshold: %d\n", subscriptionDeleteThreshold)
++	fmt.Fprintf(sb, "  delete_suggestion_count: %d\n", suggested)
++}
++
++func appendSubscriptionHealthDetails(sb *strings.Builder, subURL string) {
++	record := currentSubscriptionHealthHistory.Subscriptions[subURL]
++	fmt.Fprintf(sb,
++		"    history: { observed_runs: %d, consecutive_silent: %d, last_status: %s, last_checked_at: %s, last_success_at: %s, delete_suggested: %t }\n",
++		record.ObservedRuns,
++		record.ConsecutiveSilent,
++		strconv.Quote(record.LastStatus),
++		strconv.Quote(record.LastCheckedAt),
++		strconv.Quote(record.LastSuccessAt),
++		subscriptionDeleteSuggested(record),
++	)
++}
+diff --git a/check/subscription_history_test.go b/check/subscription_history_test.go
+new file mode 100644
+index 0000000..e2f92fd
+--- /dev/null
++++ b/check/subscription_history_test.go
+@@ -0,0 +1,75 @@
++package check
++
++import (
++	"testing"
++	"time"
++)
++
++func TestSubscriptionHealthHistoryTracksSilentStreakAndReset(t *testing.T) {
++	history := newSubscriptionHealthHistory()
++	url := "https://example.com/sub"
++	urls := []string{url}
++	start := time.Date(2026, 7, 20, 1, 2, 3, 0, time.UTC)
++
++	for run := 0; run < subscriptionDeleteThreshold; run++ {
++		applySubscriptionHealthRun(history, urls, map[string]subscriptionRunResult{
++			url: {Total: 12},
++		}, start.Add(time.Duration(run)*time.Hour), true)
++	}
++
++	record := history.Subscriptions[url]
++	if record.ConsecutiveSilent != subscriptionDeleteThreshold {
++		t.Fatalf("silent streak = %d, want %d", record.ConsecutiveSilent, subscriptionDeleteThreshold)
++	}
++	if !subscriptionDeleteSuggested(record) {
++		t.Fatal("third consecutive silent run should suggest deletion review")
++	}
++	if record.LastTotal != 12 || record.LastSuccess != 0 {
++		t.Fatalf("last run totals not recorded: %+v", record)
++	}
++
++	successAt := start.Add(4 * time.Hour)
++	applySubscriptionHealthRun(history, urls, map[string]subscriptionRunResult{
++		url: {Success: 2, Total: 12},
++	}, successAt, true)
++	record = history.Subscriptions[url]
++	if record.ConsecutiveSilent != 0 || record.LastStatus != "active" {
++		t.Fatalf("successful run did not reset streak: %+v", record)
++	}
++	if record.LastSuccessAt != successAt.Format(time.RFC3339) {
++		t.Fatalf("last success time = %q", record.LastSuccessAt)
++	}
++	if subscriptionDeleteSuggested(record) {
++		t.Fatal("active subscription must not be suggested for deletion")
++	}
++}
++
++func TestSubscriptionHealthHistorySkipsIncompleteRun(t *testing.T) {
++	history := newSubscriptionHealthHistory()
++	url := "https://example.com/sub"
++	at := time.Date(2026, 7, 20, 1, 2, 3, 0, time.UTC)
++	applySubscriptionHealthRun(history, []string{url}, map[string]subscriptionRunResult{
++		url: {Total: 8},
++	}, at, false)
++
++	if history.CompletedRuns != 0 || len(history.Subscriptions) != 0 {
++		t.Fatalf("incomplete run changed history: %+v", history)
++	}
++}
++
++func TestSubscriptionHealthHistoryDistinguishesZeroTotal(t *testing.T) {
++	history := newSubscriptionHealthHistory()
++	zeroURL := "https://example.com/no-nodes"
++	failedURL := "https://example.com/all-failed"
++	applySubscriptionHealthRun(history, []string{zeroURL, failedURL}, map[string]subscriptionRunResult{
++		zeroURL:   {Total: 0},
++		failedURL: {Total: 9},
++	}, time.Date(2026, 7, 20, 1, 2, 3, 0, time.UTC), true)
++
++	if history.Subscriptions[zeroURL].LastTotal != 0 {
++		t.Fatal("zero-node subscription lost its 0/0 state")
++	}
++	if history.Subscriptions[failedURL].LastTotal != 9 {
++		t.Fatal("all-failed subscription lost its 0/N state")
++	}
++}

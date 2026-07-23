@@ -1,0 +1,418 @@
+diff --git a/proxy/fetch.go b/proxy/fetch.go
+index 4a54e8b..abfb3de 100644
+--- a/proxy/fetch.go
++++ b/proxy/fetch.go
+@@ -46,6 +46,20 @@ var clientMapCache sync.Map
+ 
+ // FetchSubsData 获取数据 (包含重试、占位符处理、代理策略)
+ func FetchSubsData(rawURL string) ([]byte, error) {
++	return fetchSubsData(rawURL, nil)
++}
++
++// fetchSubsDataWithUserAgent 使用指定客户端 UA 拉取一次订阅。
++// 它只用于首轮正文无法解析出节点时的兼容重试，避免正常订阅增加请求。
++func fetchSubsDataWithUserAgent(rawURL, userAgent string) ([]byte, error) {
++	userAgent = strings.TrimSpace(userAgent)
++	if userAgent == "" {
++		return nil, fmt.Errorf("user-agent 不能为空")
++	}
++	return fetchSubsData(rawURL, []string{userAgent})
++}
++
++func fetchSubsData(rawURL string, overrideUserAgents []string) ([]byte, error) {
+ 	// 清洗 URL
+ 	rawURL = parse.CleanURL(rawURL)
+ 
+@@ -100,15 +114,22 @@ func FetchSubsData(rawURL string) ([]byte, error) {
+ 		"ClashMetaForAndroid/2.11.30",
+ 	}
+ 
+-	// GitHub 地址使用浏览器 ua 和curl
+-	if strings.Contains(rawURL, "githubusercontent.com") {
++	// 显式 UA 只用于解析为 0 个节点后的兼容重试。
++	if len(overrideUserAgents) > 0 {
++		uaList = append([]string(nil), overrideUserAgents...)
++	} else if strings.Contains(rawURL, "githubusercontent.com") {
++		// GitHub 地址使用浏览器 UA 和 curl。
+ 		uaList = []string{
+ 			convert.RandUserAgent(),
+ 			"curl/8.16.0",
+ 		}
+ 	}
+ 
+-	for i := range maxRetries + 1 {
++	attemptCount := maxRetries + 1
++	if len(overrideUserAgents) > 0 {
++		attemptCount = len(uaList)
++	}
++	for i := range attemptCount {
+ 		ua := uaList[i%len(uaList)]
+ 		if i > 0 {
+ 			time.Sleep(time.Duration(max(1, conf.SubUrlsRetryInterval)) * time.Second)
+diff --git a/proxy/proxies.go b/proxy/proxies.go
+index b4415ff..27272eb 100644
+--- a/proxy/proxies.go
++++ b/proxy/proxies.go
+@@ -453,6 +453,32 @@ func fetchRemoteSubUrls(listURL string) ([]string, error) {
+ // batchSize=1000, chanBuf=50, concurrency=50 → (50+50) × 1000 = 100K ✓
+ const defaultParseBatchSize = 1000
+ 
++var subscriptionClientUAFallbacks = []string{
++	"clash.meta",
++	"ClashMetaForAndroid/2.11.30",
++	"sing-box/1.13.0",
++}
++
++func shouldRetrySubscriptionWithClientUA(subURL string) bool {
++	parsedURL, err := url.Parse(parse.CleanURL(subURL))
++	return err == nil && !isGitHubRequest(parsedURL)
++}
++
++func isStructurallyValidSubscriptionNode(node map[string]any) bool {
++	serverStr := strings.TrimSpace(fmt.Sprintf("%v", node["server"]))
++	port := parse.ToIntPort(node["port"])
++	return serverStr != "" && serverStr != "<nil>" &&
++		port > 0 && port <= 65535 && node["type"] != nil
++}
++
++func subscriptionHostname(subURL string) string {
++	parsedURL, err := url.Parse(parse.CleanURL(subURL))
++	if err != nil {
++		return ""
++	}
++	return parsedURL.Hostname()
++}
++
+ // processSubscription 单个订阅的处理流程。
+ //
+ // 使用 parse.ParseSubscriptionDataStream 逐节点回调，内部不再持有该订阅的
+@@ -475,9 +501,10 @@ func processSubscription(
+ 	filterTypes := config.GlobalConfig.NodeType
+ 
+ 	var (
+-		rawHits      int // 层 1：解析阶段产出的候选节点数（可能含同订阅内跨解析器重复，见 parse/stream.go）
+-		validCount   int // 层 2：通过类型/端口校验、实际发往全局去重队列的节点数（去重前）
+-		typeFiltered int
++		rawHits             int // 层 1：解析阶段产出的候选节点数（可能含同订阅内跨解析器重复，见 parse/stream.go）
++		structuralValidHits int // 层 2：通过 server/port/type 结构校验的候选数（类型过滤前）
++		validCount          int // 层 3：实际发往全局去重队列的节点数（去重前）
++		typeFiltered        int
+ 	)
+ 
+ 	batch := make([]map[string]any, 0, batchSize)
+@@ -499,6 +526,10 @@ func processSubscription(
+ 	// handle 既用作 ParseSubscriptionDataStream 的 yield 回调，也用于处理兜底正则提取出的节点
+ 	handle := func(node map[string]any) bool {
+ 		rawHits++
++		structurallyValid := isStructurallyValidSubscriptionNode(node)
++		if structurallyValid {
++			structuralValidHits++
++		}
+ 
+ 		// 类型过滤
+ 		if len(filterTypes) > 0 {
+@@ -512,9 +543,7 @@ func processSubscription(
+ 		parse.NormalizeNode(node)
+ 
+ 		// 有效性校验
+-		serverStr := strings.TrimSpace(fmt.Sprintf("%v", node["server"]))
+-		port := parse.ToIntPort(node["port"])
+-		if serverStr == "" || serverStr == "<nil>" || port <= 0 || port > 65535 || node["type"] == nil {
++		if !structurallyValid {
+ 			slog.Debug("过滤掉无效的畸形节点", "订阅", urlStr, "数据", node)
+ 			return true
+ 		}
+@@ -539,11 +568,40 @@ func processSubscription(
+ 		return true
+ 	}
+ 
+-	parseStats, streamErr := parse.ParseSubscriptionDataStream(data, urlStr, handle)
+-	if streamErr != nil {
+-		// 兜底：正则提取，通常节点量极少，无需流式
+-		for _, node := range parse.FallbackExtractV2Ray(data, urlStr) {
+-			handle(node)
++	parseAttempt := func(payload []byte) (map[string]int, int, int) {
++		rawBefore := rawHits
++		structuralBefore := structuralValidHits
++		stats, streamErr := parse.ParseSubscriptionDataStream(payload, urlStr, handle)
++		if streamErr != nil {
++			// 兜底：正则提取，通常节点量极少，无需流式
++			for _, node := range parse.FallbackExtractV2Ray(payload, urlStr) {
++				handle(node)
++			}
++		}
++		return stats, rawHits - rawBefore, structuralValidHits - structuralBefore
++	}
++
++	parseStats, _, structuralHits := parseAttempt(data)
++	if structuralHits == 0 && shouldRetrySubscriptionWithClientUA(urlStr) {
++		for _, userAgent := range subscriptionClientUAFallbacks {
++			retryData, retryErr := fetchSubsDataWithUserAgent(urlStr, userAgent)
++			if retryErr != nil {
++				slog.Debug("兼容 UA 拉取失败", "UA", userAgent, "error", retryErr)
++				continue
++			}
++
++			var retryRawHits, retryStructuralHits int
++			parseStats, retryRawHits, retryStructuralHits = parseAttempt(retryData)
++			retryData = nil
++			if retryStructuralHits > 0 {
++				slog.Info("订阅使用兼容 UA 解析成功",
++					"订阅域名", subscriptionHostname(urlStr),
++					"UA", userAgent,
++					"候选", retryRawHits,
++					"结构有效", retryStructuralHits,
++				)
++				break
++			}
+ 		}
+ 	}
+ 	data = nil
+@@ -559,6 +617,7 @@ func processSubscription(
+ 	slog.Debug("订阅解析完成",
+ 		"URL", urlStr,
+ 		"候选", rawHits,
++		"结构有效", structuralValidHits,
+ 		"类型过滤", typeFiltered,
+ 		"入队", validCount,
+ 	)
+diff --git a/proxy/ua_fallback_test.go b/proxy/ua_fallback_test.go
+new file mode 100644
+index 0000000..af06de9
+--- /dev/null
++++ b/proxy/ua_fallback_test.go
+@@ -0,0 +1,233 @@
++package proxies
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"slices"
++	"sync"
++	"sync/atomic"
++	"testing"
++
++	"github.com/sinspired/subs-check-pro/v2/config"
++	"github.com/sinspired/subs-check-pro/v2/proxy/parse"
++)
++
++func malformedSubscriptionHTML() []byte {
++	return []byte(`<!doctype html><html><body>
++<a href="clash://install-config?url=https%3A%2F%2Fsubscription.example&name=clash">Open Clash</a>
++<script>window.__CF$cv$params = {r:'abc',t:'MT',m:'not-a-port'};</script>
++<script src="https://static.example/beacon.min.js"></script>
++</body></html>`)
++}
++
++func TestProcessSubscriptionRetriesClientUAAfterOnlyMalformedCandidates(t *testing.T) {
++	originalConfig := config.GlobalConfig
++	config.GlobalConfig = &config.Config{
++		SubUrlsReTry:   1,
++		SubUrlsTimeout: 10,
++		SystemProxy:    "direct",
++	}
++	t.Cleanup(func() {
++		config.GlobalConfig = originalConfig
++		ClearFetchCache()
++	})
++
++	var fixtureRawHits, fixtureStructuralHits int
++	_, _ = parseSubscriptionFixture(malformedSubscriptionHTML(), func(node map[string]any) bool {
++		fixtureRawHits++
++		if isStructurallyValidSubscriptionNode(node) {
++			fixtureStructuralHits++
++		}
++		return true
++	})
++	if fixtureRawHits == 0 || fixtureStructuralHits != 0 {
++		t.Fatalf("malformed HTML fixture produced raw=%d structural=%d, want raw>0 structural=0", fixtureRawHits, fixtureStructuralHits)
++	}
++
++	var (
++		mu      sync.Mutex
++		seenUAs []string
++	)
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		mu.Lock()
++		seenUAs = append(seenUAs, r.UserAgent())
++		mu.Unlock()
++
++		if r.UserAgent() != "clash.meta" {
++			w.Header().Set("Content-Type", "text/html")
++			_, _ = w.Write(malformedSubscriptionHTML())
++			return
++		}
++
++		_, _ = w.Write([]byte(`proxies:
++  - name: compatible
++    type: ss
++    server: 192.0.2.1
++    port: 443
++    cipher: aes-128-gcm
++    password: test
++`))
++	}))
++	t.Cleanup(server.Close)
++
++	out := make(chan []map[string]any, 1)
++	processSubscription(server.URL+"/sub", "", false, false, out, 10)
++
++	select {
++	case batch := <-out:
++		if len(batch) != 1 || batch[0]["name"] != "compatible" {
++			t.Fatalf("unexpected parsed batch: %+v", batch)
++		}
++	default:
++		t.Fatal("compatible UA did not produce a proxy batch")
++	}
++
++	mu.Lock()
++	gotUAs := append([]string(nil), seenUAs...)
++	mu.Unlock()
++	if len(gotUAs) < 2 || gotUAs[0] != "mihomo/1.19.27" || !slices.Contains(gotUAs, "clash.meta") {
++		t.Fatalf("UA fallback sequence = %v", gotUAs)
++	}
++}
++
++func parseSubscriptionFixture(data []byte, yield func(map[string]any) bool) (map[string]int, error) {
++	return parse.ParseSubscriptionDataStream(data, "https://subscription.example", yield)
++}
++
++func TestProcessSubscriptionContinuesAfterMalformedFallbackUA(t *testing.T) {
++	originalConfig := config.GlobalConfig
++	config.GlobalConfig = &config.Config{
++		SubUrlsReTry:   1,
++		SubUrlsTimeout: 10,
++		SystemProxy:    "direct",
++	}
++	t.Cleanup(func() {
++		config.GlobalConfig = originalConfig
++		ClearFetchCache()
++	})
++
++	var (
++		mu      sync.Mutex
++		seenUAs []string
++	)
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		mu.Lock()
++		seenUAs = append(seenUAs, r.UserAgent())
++		mu.Unlock()
++
++		if r.UserAgent() != "ClashMetaForAndroid/2.11.30" {
++			_, _ = w.Write(malformedSubscriptionHTML())
++			return
++		}
++
++		_, _ = w.Write([]byte(`proxies:
++  - name: android-compatible
++    type: ss
++    server: 192.0.2.3
++    port: 443
++    cipher: aes-128-gcm
++    password: test
++`))
++	}))
++	t.Cleanup(server.Close)
++
++	out := make(chan []map[string]any, 1)
++	processSubscription(server.URL+"/sub", "", false, false, out, 10)
++
++	select {
++	case batch := <-out:
++		if len(batch) != 1 || batch[0]["name"] != "android-compatible" {
++			t.Fatalf("unexpected parsed batch: %+v", batch)
++		}
++	default:
++		t.Fatal("second compatible UA did not produce a proxy batch")
++	}
++
++	mu.Lock()
++	gotUAs := append([]string(nil), seenUAs...)
++	mu.Unlock()
++	if !slices.Contains(gotUAs, "clash.meta") || !slices.Contains(gotUAs, "ClashMetaForAndroid/2.11.30") {
++		t.Fatalf("UA fallback sequence = %v", gotUAs)
++	}
++}
++
++func TestShouldRetrySubscriptionWithClientUASkipsGitHub(t *testing.T) {
++	if shouldRetrySubscriptionWithClientUA("https://raw.githubusercontent.com/example/repo/main/sub.yaml") {
++		t.Fatal("GitHub raw subscriptions should not receive redundant UA retries")
++	}
++	if !shouldRetrySubscriptionWithClientUA("https://subscription.example/sub") {
++		t.Fatal("ordinary subscriptions should allow client UA retries")
++	}
++}
++
++func TestProcessSubscriptionDoesNotRetryValidFirstResponse(t *testing.T) {
++	originalConfig := config.GlobalConfig
++	config.GlobalConfig = &config.Config{
++		SubUrlsReTry:   1,
++		SubUrlsTimeout: 10,
++		SystemProxy:    "direct",
++	}
++	t.Cleanup(func() {
++		config.GlobalConfig = originalConfig
++		ClearFetchCache()
++	})
++
++	var requestCount atomic.Int32
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		requestCount.Add(1)
++		_, _ = w.Write([]byte(`proxies:
++  - name: first-response
++    type: ss
++    server: 192.0.2.2
++    port: 443
++    cipher: aes-128-gcm
++    password: test
++`))
++	}))
++	t.Cleanup(server.Close)
++
++	out := make(chan []map[string]any, 1)
++	processSubscription(server.URL+"/sub", "", false, false, out, 10)
++	if requestCount.Load() != 1 {
++		t.Fatalf("valid subscription requests = %d, want 1", requestCount.Load())
++	}
++}
++
++func TestProcessSubscriptionDoesNotRetryStructurallyValidFilteredResponse(t *testing.T) {
++	originalConfig := config.GlobalConfig
++	config.GlobalConfig = &config.Config{
++		SubUrlsReTry:   1,
++		SubUrlsTimeout: 10,
++		SystemProxy:    "direct",
++		NodeType:       []string{"vless"},
++	}
++	t.Cleanup(func() {
++		config.GlobalConfig = originalConfig
++		ClearFetchCache()
++	})
++
++	var requestCount atomic.Int32
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		requestCount.Add(1)
++		_, _ = w.Write([]byte(`proxies:
++  - name: filtered-ss
++    type: ss
++    server: 192.0.2.4
++    port: 443
++    cipher: aes-128-gcm
++    password: test
++`))
++	}))
++	t.Cleanup(server.Close)
++
++	out := make(chan []map[string]any, 1)
++	processSubscription(server.URL+"/sub", "", false, false, out, 10)
++	if requestCount.Load() != 1 {
++		t.Fatalf("structurally valid filtered subscription requests = %d, want 1", requestCount.Load())
++	}
++	select {
++	case batch := <-out:
++		t.Fatalf("filtered response unexpectedly produced a batch: %+v", batch)
++	default:
++	}
++}
+
