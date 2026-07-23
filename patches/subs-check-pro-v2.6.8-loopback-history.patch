@@ -1,0 +1,143 @@
+diff --git a/proxy/proxies.go b/proxy/proxies.go
+index b4415ff..ef3ea6a 100644
+--- a/proxy/proxies.go
++++ b/proxy/proxies.go
+@@ -7,6 +7,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"log/slog"
++	"net"
+ 	"net/http"
+ 	"net/url"
+ 	"os"
+@@ -243,8 +244,8 @@ func GetProxies() ([]map[string]any, int, int, int, error) {
+ 	// 生产者：并发拉取订阅
+ 	sem := make(chan struct{}, concurrency)
+ 	var wg sync.WaitGroup
+-	listenPort := strings.TrimPrefix(config.GlobalConfig.ListenPort, ":")
+-	subStorePort := strings.TrimPrefix(config.GlobalConfig.SubStorePort, ":")
++	listenPort := normalizeListenPort(config.GlobalConfig.ListenPort)
++	subStorePort := normalizeListenPort(config.GlobalConfig.SubStorePort)
+ 
+ 	for _, subURL := range subUrls {
+ 		wg.Add(1)
+@@ -322,9 +323,8 @@ func resolveSubUrls() ([]string, int, int, int) {
+ 		slog.Info("获取订阅列表")
+ 	}
+ 
+-	requiredListenPort := strings.TrimSpace(strings.TrimPrefix(config.GlobalConfig.ListenPort, ":"))
+-	localLastSucced := "http://127.0.0.1:" + requiredListenPort + "/all.yaml"
+-	localHistory := "http://127.0.0.1:" + requiredListenPort + "/history.yaml"
++	localLastSucced := localSubscriptionURL(config.GlobalConfig.ListenPort, "all.yaml")
++	localHistory := localSubscriptionURL(config.GlobalConfig.ListenPort, "history.yaml")
+ 
+ 	// 如果用户设置了保留成功节点，则把本地的 all.yaml 和 history.yaml 放到最前面
+ 	if config.GlobalConfig.KeepSuccessProxies {
+@@ -560,6 +560,27 @@ func processSubscription(
+ 	)
+ }
+ 
++// normalizeListenPort accepts the port-only values used by upstream as well as
++// host-qualified listen addresses used to restrict the WebUI to loopback.
++func normalizeListenPort(listenAddress string) string {
++	listenAddress = strings.TrimSpace(listenAddress)
++	if _, port, err := net.SplitHostPort(listenAddress); err == nil {
++		return port
++	}
++	return strings.TrimPrefix(listenAddress, ":")
++}
++
++// localSubscriptionURL always connects through IPv4 loopback. The configured
++// host controls where the WebUI listens; only its numeric port belongs in this
++// internal URL.
++func localSubscriptionURL(listenAddress, filename string) string {
++	return (&url.URL{
++		Scheme: "http",
++		Host:   net.JoinHostPort("127.0.0.1", normalizeListenPort(listenAddress)),
++		Path:   "/" + strings.TrimPrefix(filename, "/"),
++	}).String()
++}
++
+ // identifyLocalSubType 识别本地订阅源类型
+ func identifyLocalSubType(subURL, listenPort, storePort string) (isLatest, isHistory bool, tag string) {
+ 	u, err := url.Parse(subURL)
+diff --git a/proxy/local_subscription_test.go b/proxy/local_subscription_test.go
+new file mode 100644
+index 0000000..7b9b3df
+--- /dev/null
++++ b/proxy/local_subscription_test.go
+@@ -0,0 +1,74 @@
++package proxies
++
++import "testing"
++
++func TestNormalizeListenPort(t *testing.T) {
++	tests := map[string]string{
++		"8199":           "8199",
++		":8199":          "8199",
++		"127.0.0.1:8199": "8199",
++		"localhost:8199": "8199",
++		"[::1]:8199":     "8199",
++		" 127.0.0.1:8199 ": "8199",
++	}
++
++	for input, want := range tests {
++		t.Run(input, func(t *testing.T) {
++			if got := normalizeListenPort(input); got != want {
++				t.Fatalf("normalizeListenPort(%q) = %q, want %q", input, got, want)
++			}
++		})
++	}
++}
++
++func TestLocalSubscriptionURLWithLoopbackQualifiedListenAddress(t *testing.T) {
++	tests := []struct {
++		filename string
++		want     string
++	}{
++		{filename: "all.yaml", want: "http://127.0.0.1:8199/all.yaml"},
++		{filename: "history.yaml", want: "http://127.0.0.1:8199/history.yaml"},
++	}
++
++	for _, test := range tests {
++		t.Run(test.filename, func(t *testing.T) {
++			got := localSubscriptionURL("127.0.0.1:8199", test.filename)
++			if got != test.want {
++				t.Fatalf("localSubscriptionURL() = %q, want %q", got, test.want)
++			}
++		})
++	}
++}
++
++func TestIdentifyLocalSubTypeWithQualifiedConfiguredPort(t *testing.T) {
++	listenPort := normalizeListenPort("127.0.0.1:8199")
++	storePort := normalizeListenPort("8299")
++
++	tests := []struct {
++		url         string
++		wantLatest  bool
++		wantHistory bool
++		wantTag     string
++	}{
++		{
++			url:        "http://127.0.0.1:8199/all.yaml#Succeed",
++			wantLatest: true,
++			wantTag:    "Succeed",
++		},
++		{
++			url:         "http://127.0.0.1:8199/history.yaml#History",
++			wantHistory: true,
++			wantTag:     "History",
++		},
++	}
++
++	for _, test := range tests {
++		t.Run(test.wantTag, func(t *testing.T) {
++			latest, history, tag := identifyLocalSubType(test.url, listenPort, storePort)
++			if latest != test.wantLatest || history != test.wantHistory || tag != test.wantTag {
++				t.Fatalf("identifyLocalSubType() = (%v, %v, %q), want (%v, %v, %q)",
++					latest, history, tag, test.wantLatest, test.wantHistory, test.wantTag)
++			}
++		})
++	}
++}

@@ -1,0 +1,231 @@
+diff --git a/webui/static/css/analysis.css b/webui/static/css/analysis.css
+index 2c2cdab..d0d9376 100644
+--- a/webui/static/css/analysis.css
++++ b/webui/static/css/analysis.css
+@@ -2049,9 +2049,8 @@ h1 svg {
+ 
+ .bad-item {
+   display: flex;
+-  align-items: center;
+-  justify-content: space-between;
+-  padding: 8px 12px;
++  align-items: flex-start;
++  padding: 10px 12px;
+   border-bottom: 1px solid var(--border);
+   gap: 8px;
+ }
+@@ -2071,12 +2070,77 @@ h1 svg {
+   min-width: 0;
+ }
+ 
++.bad-item-main {
++  min-width: 0;
++  flex: 1;
++}
++
++.bad-item-top {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  gap: 8px;
++}
++
+ .bad-count {
+   font-size: 11px;
+   color: var(--muted);
+   flex-shrink: 0;
+ }
+ 
++.bad-health {
++  display: flex;
++  align-items: center;
++  flex-wrap: wrap;
++  gap: 5px 8px;
++  margin-top: 7px;
++  font-size: 10px;
++  color: var(--muted);
++}
++
++.bad-health-tag,
++.bad-suggest-count {
++  padding: 2px 6px;
++  border-radius: 999px;
++  color: var(--muted);
++  background: color-mix(in srgb, var(--muted) 10%, transparent);
++  white-space: nowrap;
++}
++
++.bad-health-tag.warn {
++  color: var(--warning);
++  background: color-mix(in srgb, var(--warning) 12%, transparent);
++}
++
++.bad-health-tag.danger,
++.bad-suggest-count {
++  color: var(--danger);
++  background: color-mix(in srgb, var(--danger) 12%, transparent);
++}
++
++.bad-suggest-count {
++  margin-left: 7px;
++  font-size: 10px;
++  font-weight: 600;
++  letter-spacing: 0;
++}
++
++.bad-history-note {
++  margin: 0 0 8px;
++  padding: 8px 10px;
++  border: 1px solid color-mix(in srgb, var(--primary) 20%, var(--border));
++  border-radius: 8px;
++  background: color-mix(in srgb, var(--primary) 5%, transparent);
++  color: var(--muted);
++  font-size: 11px;
++  line-height: 1.5;
++}
++
++.bad-history-text,
++.bad-cause {
++  white-space: nowrap;
++}
++
+ /* ── 配置分析 ── */
+ .cfg-analysis-grid {
+   display: grid;
+diff --git a/webui/static/js/analysis.js b/webui/static/js/analysis.js
+index 2928721..b3188d2 100644
+--- a/webui/static/js/analysis.js
++++ b/webui/static/js/analysis.js
+@@ -784,6 +784,13 @@ function fmtRate(r) {
+     return Math.round(r) + '%';
+ }
+ 
++function fmtHistoryTime(value) {
++    if (!value) return '';
++    const date = new Date(value);
++    if (Number.isNaN(date.getTime())) return String(value);
++    return `${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')} ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
++}
++
+ let _reportData = null;
+ 
+ function renderReport(r, cfg) {
+@@ -1312,19 +1319,57 @@ function renderSubs(subs, subsBad, cfg) {
+         document.getElementById('badContent').innerHTML = '';
+         return;
+     }
++    const historyMeta = _reportData?.subscription_history || {};
++    const hasHistoryMeta = Object.prototype.hasOwnProperty.call(_reportData || {}, 'subscription_history');
++    const sortedBad = [...subsBad].sort((a, b) => {
++        const aHistory = a.history || {}, bHistory = b.history || {};
++        return Number(Boolean(bHistory.delete_suggested)) - Number(Boolean(aHistory.delete_suggested))
++            || parseCount(bHistory.consecutive_silent) - parseCount(aHistory.consecutive_silent);
++    });
++    const suggestedCount = sortedBad.filter(s => s.history?.delete_suggested === true).length;
++    const historyNotice = !hasHistoryMeta
++        ? '历史趋势将在下一次完整检测后开始累计。'
++        : historyMeta.run_counted === false
++            ? '本次检测未完整完成，连续沉默次数没有增加。'
++            : `已累计 ${parseCount(historyMeta.completed_runs)} 次完整检测；连续 ${parseCount(historyMeta.delete_suggestion_threshold) || 3} 次沉默才建议核查删除。`;
++
+     document.getElementById('badContent').innerHTML =
+         `<div class="section-title-toggle" onclick="toggleBad()">
+        沉默订阅&nbsp;<span style="font-weight:400;text-transform:none;letter-spacing:0">(${subsBad.length})</span>
++       ${suggestedCount ? `<span class="bad-suggest-count">建议核查/删除 ${suggestedCount}</span>` : ''}
+        <span class="toggle-line"></span>
+        <svg class="toggle-chevron" id="badChevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </div>
+      <div id="badList" style="display:none">
++       <div class="bad-history-note">${historyNotice}</div>
+        <div class="bad-list">
+-         ${subsBad.map(s => {
++         ${sortedBad.map(s => {
+             const st = s.stats || {};
++            const history = s.history || {};
++            const observedRuns = parseCount(history.observed_runs);
++            const silentRuns = parseCount(history.consecutive_silent);
++            const lastSuccess = fmtHistoryTime(history.last_success_at);
++            const total = parseCount(st.total);
++            const deleteSuggested = history.delete_suggested === true;
++            const historyText = observedRuns === 0
++                ? '历史待累计'
++                : lastSuccess
++                    ? `上次可用 ${lastSuccess}`
++                    : '记录期内从未通过测活';
++            const causeText = total > 0 ? `已解析 ${total} 个节点，全部未通过` : '未解析出可测节点';
+             return `<div class="bad-item">
+-             <span class="bad-url" title="${esc(s.url)}">${esc(s.url)}</span>
+-             <span class="bad-count">${st.success || 0}/${st.total || 0}</span>
++             <div class="bad-item-main">
++               <div class="bad-item-top">
++                 <span class="bad-url" title="${esc(s.url)}">${esc(s.url)}</span>
++                 <span class="bad-count">${st.success || 0}/${st.total || 0}</span>
++               </div>
++               <div class="bad-health">
++                 <span class="bad-health-tag ${silentRuns >= 2 ? 'warn' : ''}">${observedRuns ? `连续沉默 ${silentRuns} 次` : '尚无跨次记录'}</span>
++                 <span class="bad-history-text">${historyText}</span>
++                 <span class="bad-cause">${causeText}</span>
++                 ${deleteSuggested ? '<span class="bad-health-tag danger">建议核查/删除</span>' : ''}
++               </div>
++             </div>
+            </div>`;
+         }).join('')}
+        </div>
+@@ -1559,6 +1604,9 @@ function renderConfig(ci, ga, sr, sb, cfg) {
+     const checked = parseCount(ci.check_count_raw);
+     const speed = parseInt(String(ci.check_min_speed || '0').replace(/[^0-9]/g, '')) || 0;
+     const badCnt = sb.length, goodCnt = sr.length;
++    const historyMeta = _reportData?.subscription_history || {};
++    const historyRuns = parseCount(historyMeta.completed_runs);
++    const deletionCandidates = sb.filter(s => s.history?.delete_suggested === true).length;
+     const qm = ga.quality_metrics || {};
+     const passRate = checked > 0
+         ? Math.min(100, total / checked * 100) : 0;
+@@ -1625,6 +1673,8 @@ function renderConfig(ci, ga, sr, sb, cfg) {
+         { k: '通过率', v: checked > 0 ? fmtRate(passRate) : '—', cls: passRate >= 1 ? 'ok' : passRate > 0 ? 'warn' : 'bad' },
+         { k: '活跃订阅', v: goodCnt + ' 个' },
+         { k: '沉默订阅', v: badCnt + ' 个', cls: badCnt > 0 ? 'warn' : 'ok' },
++        { k: '历史完整检测', v: historyRuns + ' 次' },
++        { k: '建议核查/删除', v: deletionCandidates + ' 个', cls: deletionCandidates > 0 ? 'bad' : 'ok' },
+         { k: '检测时间', v: ci.check_time || '-' },
+     ];
+ 
+@@ -1738,11 +1788,14 @@ function renderConfig(ci, ga, sr, sb, cfg) {
+     });
+     if (badCnt > 0 && totalSubs > 0) {
+         const r = Math.round(badCnt / totalSubs * 100);
+-        if (r > 50) suggests.push({ l: 'warn', t: `沉默订阅占比 ${r}%（${badCnt}/${totalSubs}），超半数沉默，建议清理或替换低质订阅源。` });
+-        else suggests.push({ l: 'info', t: `存在 ${badCnt} 个沉默订阅（${r}%），可前往"订阅排名"标签查看。` });
++        if (deletionCandidates > 0) suggests.push({ l: 'warn', t: `${deletionCandidates} 个订阅已连续至少 3 次完整检测沉默，建议先核查链接状态，再考虑删除。` });
++        else suggests.push({ l: 'info', t: `本次有 ${badCnt} 个沉默订阅（${r}%），尚未达到连续 3 次的删除建议门槛。` });
+     } else if (badCnt === 0 && goodCnt > 0) {
+         suggests.push({ l: 'good', t: '所有订阅源均活跃，订阅源状态良好。' });
+     }
++    if (historyMeta.run_counted === false) {
++        suggests.push({ l: 'info', t: '本次检测中止或因成功数上限提前结束，未计入连续沉默历史。' });
++    }
+ 
+     // 3. 速度测试参数
+     if (minSpeed === 0) suggests.push({ l: 'warn', tab: 'subscriptions', t: '<code>min-speed</code> 未设置，所有节点（含极慢节点）均被收录，建议设为 128–500 KB/s。' });
+diff --git a/webui/templates/analysis.html b/webui/templates/analysis.html
+index faf9ea4..9f525e3 100644
+--- a/webui/templates/analysis.html
++++ b/webui/templates/analysis.html
+@@ -10,7 +10,7 @@
+   <title>分析报告 - Subs-Check-PRO</title>
+   <link rel="icon" type="image/svg+xml" href="/static/icon/favicon.svg" />
+   <link rel="stylesheet" href="/static/css/admin.css?v20260324" />
+-  <link rel="stylesheet" href="/static/css/analysis.css?v20260324" />
++  <link rel="stylesheet" href="/static/css/analysis.css?v20260720-sub-history" />
+   <script src="/static/js/libs/yaml.bundle.js?v20260324"></script>
+ </head>
+ 
+@@ -337,7 +337,7 @@
+   </div>
+ 
+   <script type="module" src="/static/js/admin.js?v20260324"></script>
+-  <script src="/static/js/analysis.js?v20260719-analysis-fix"></script>
++  <script src="/static/js/analysis.js?v20260720-sub-history"></script>
+   <script>
+     // 同步侧边栏主题图标与 topbar themeToggle 状态
+     (function () {

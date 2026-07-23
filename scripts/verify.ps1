@@ -8,6 +8,12 @@ $config = Join-Path $workspace 'runtime\config\config.yaml'
 $customCore = Join-Path $workspace 'runtime\bin\subs-check-pro-custom-v2.6.8.exe'
 $officialCore = Join-Path $workspace 'runtime\bin\subs-check-pro-official-v2.6.8.exe'
 $renamePatch = Join-Path $workspace 'patches\subs-check-pro-v2.6.8-custom-rename.patch'
+$analysisPatch = Join-Path $workspace 'patches\subs-check-pro-v2.6.8-analysis-report.patch'
+$webuiAnalysisPatch = Join-Path $workspace 'patches\subs-check-pro-webui-b8db5f51c367-analysis-report.patch'
+$historyPatch = Join-Path $workspace 'patches\subs-check-pro-v2.6.8-subscription-history.patch'
+$webuiHistoryPatch = Join-Path $workspace 'patches\subs-check-pro-webui-b8db5f51c367-subscription-history.patch'
+$uaFallbackPatch = Join-Path $workspace 'patches\subs-check-pro-v2.6.8-ua-fallback.patch'
+$loopbackHistoryPatch = Join-Path $workspace 'patches\subs-check-pro-v2.6.8-loopback-history.patch'
 $failures = New-Object System.Collections.Generic.List[string]
 
 function Test-RequiredPath {
@@ -25,6 +31,51 @@ Test-RequiredPath -Path $config -Label 'Config exists'
 Test-RequiredPath -Path $customCore -Label 'Custom rename core exists'
 Test-RequiredPath -Path $officialCore -Label 'Official v2.6.8 core backup exists'
 Test-RequiredPath -Path $renamePatch -Label 'Custom rename patch exists'
+Test-RequiredPath -Path $analysisPatch -Label 'Analysis report core patch exists'
+Test-RequiredPath -Path $webuiAnalysisPatch -Label 'Analysis report WebUI patch exists'
+Test-RequiredPath -Path $historyPatch -Label 'Subscription history core patch exists'
+Test-RequiredPath -Path $webuiHistoryPatch -Label 'Subscription history WebUI patch exists'
+Test-RequiredPath -Path $uaFallbackPatch -Label 'Subscription UA fallback patch exists'
+Test-RequiredPath -Path $loopbackHistoryPatch -Label 'Loopback history replay patch exists'
+
+try {
+    $uaPatchText = [IO.File]::ReadAllText($uaFallbackPatch)
+    foreach ($signature in @(
+        'structuralValidHits',
+        'if structuralHits == 0',
+        'if retryStructuralHits > 0',
+        'TestProcessSubscriptionRetriesClientUAAfterOnlyMalformedCandidates',
+        'TestProcessSubscriptionDoesNotRetryStructurallyValidFilteredResponse'
+    )) {
+        if (-not $uaPatchText.Contains($signature)) {
+            throw "UA fallback v2 signature is missing: $signature"
+        }
+    }
+    Write-Output '[OK] Subscription UA fallback uses structurally valid nodes'
+} catch {
+    Write-Output "[FAIL] Subscription UA fallback verification failed: $($_.Exception.Message)"
+    $failures.Add('Subscription UA fallback v2')
+}
+
+try {
+    $loopbackPatchText = [IO.File]::ReadAllText($loopbackHistoryPatch)
+    foreach ($signature in @(
+        'normalizeListenPort',
+        'net.SplitHostPort',
+        'localSubscriptionURL',
+        'http://127.0.0.1:8199/all.yaml',
+        'http://127.0.0.1:8199/history.yaml',
+        'TestIdentifyLocalSubTypeWithQualifiedConfiguredPort'
+    )) {
+        if (-not $loopbackPatchText.Contains($signature)) {
+            throw "Loopback history signature is missing: $signature"
+        }
+    }
+    Write-Output '[OK] Loopback success/history replay uses normalized ports'
+} catch {
+    Write-Output "[FAIL] Loopback history verification failed: $($_.Exception.Message)"
+    $failures.Add('Loopback history replay')
+}
 
 try {
     $currentHash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
@@ -88,9 +139,66 @@ try {
 }
 
 try {
+    $analysisPage = Invoke-WebRequest -UseBasicParsing `
+        -Uri 'http://127.0.0.1:8199/analysis' `
+        -TimeoutSec 8
+    if (-not $analysisPage.Content.Contains('/static/js/analysis.js?v20260720-sub-history') -or
+        -not $analysisPage.Content.Contains('/static/css/analysis.css?v20260720-sub-history')) {
+        throw 'analysis page cache-busting version is missing'
+    }
+    $analysisScript = Invoke-WebRequest -UseBasicParsing `
+        -Uri 'http://127.0.0.1:8199/static/js/analysis.js?v20260720-sub-history' `
+        -TimeoutSec 8
+    $hasAnalysisToggle = $analysisScript.Content.Contains('toggleIncludeBad(this.checked)')
+    $hasCombinedCount = $analysisScript.Content.Contains('setBadVisibility(include && silentCount > 0)')
+    $hasHistoryTrend = $analysisScript.Content.Contains('consecutive_silent')
+    $hasDeleteSuggestion = $analysisScript.Content.Contains('delete_suggested')
+    if (-not ($hasAnalysisToggle -and $hasCombinedCount -and $hasHistoryTrend -and $hasDeleteSuggestion)) {
+        throw 'active WebUI does not contain the analysis report history fix'
+    }
+    Write-Output '[OK] Analysis report interaction and cross-run history are active'
+} catch {
+    Write-Output "[FAIL] Analysis report WebUI verification failed: $($_.Exception.Message)"
+    $failures.Add('Analysis report WebUI')
+}
+
+$analysisReport = Join-Path $workspace 'runtime\output\stats\subs-analysis.yaml'
+$historyReport = Join-Path $workspace 'runtime\output\stats\subs-health-history.yaml'
+if (Test-Path -LiteralPath $analysisReport -PathType Leaf) {
+    $analysisReportText = [IO.File]::ReadAllText($analysisReport)
+    $activeBlock = [regex]::Match(
+        $analysisReportText,
+        '(?ms)^subs_ranking:\s*(.*?)^subs_ranking_bad:'
+    )
+    if ($activeBlock.Success) {
+        $totals = [regex]::Matches($activeBlock.Groups[1].Value, 'total:\s*(\d+)')
+        $positiveTotals = @($totals | Where-Object { [int]$_.Groups[1].Value -gt 0 })
+        if ($totals.Count -gt 0 -and $positiveTotals.Count -eq 0) {
+            Write-Output '[WARN] Existing analysis report predates the fix; run one new detection to regenerate it'
+        } else {
+            Write-Output '[OK] Existing analysis report contains subscription totals'
+        }
+    }
+}
+
+if (Test-Path -LiteralPath $historyReport -PathType Leaf) {
+    $historyText = [IO.File]::ReadAllText($historyReport)
+    if ($historyText -match '(?m)^version:\s*1\s*$' -and
+        $historyText -match '(?m)^completed_runs:\s*\d+\s*$' -and
+        $historyText -match '(?m)^subscriptions:\s*$') {
+        Write-Output '[OK] Subscription health history is persisted'
+    } else {
+        Write-Output '[FAIL] Subscription health history file is malformed'
+        $failures.Add('Subscription health history')
+    }
+} else {
+    Write-Output '[WARN] Subscription health history will start after the next completed detection'
+}
+
+try {
     $versionInfo = Invoke-RestMethod -UseBasicParsing `
         -Uri 'http://127.0.0.1:8199/admin/version' -TimeoutSec 8
-    if ($versionInfo.version -ne 'v2.6.8+custom.rename') {
+    if ($versionInfo.version -ne 'v2.6.8+custom.history.ua2.loopback1') {
         throw "Unexpected active version: $($versionInfo.version)"
     }
     Write-Output '[OK] Active version uses non-prerelease custom metadata'

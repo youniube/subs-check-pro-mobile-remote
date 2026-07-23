@@ -37,8 +37,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build-custom-core.ps1
 节点使用 `🇭🇰 香港 01 | 1x` 格式：地区内编号补齐为两位，原名存在大于 0 的倍率时
 保留并统一为小写 `x`；`0x` 等无效倍率会被丢弃，`01x` 等前导零会被规范化为
 `1x`，原名没有倍率时不虚构倍率。IP
-归属查询失败时，会继续从原名中的国旗、开头国家代码、中文或英文国家名推断地区；
-能识别就按相同格式重命名，无法可靠识别才保留原名。
+归属查询失败时，会继续从原名中的国旗、开头国家代码、明确分隔符后的国家代码
+（例如 `::US`）、中文或英文国家名推断地区；能识别就按相同格式重命名，
+无法可靠识别的节点会从最终结果中删除。
 
 为了防止官方自动更新覆盖本地补丁，核心自动更新已关闭。这个开关只禁止自动替换
 可执行文件，程序仍会检查上游版本并在确有新 Release 时显示 `NEW`。升级核心前需要
@@ -49,6 +50,48 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build-custom-core.ps1
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\build-custom-core.ps1
 ```
+
+## 保留成功与历史节点
+
+开启 `keep-success-proxies` 后，核心会在下一次检测时自动回读本机生成的 `all.yaml` 和
+`history.yaml`。官方 v2.6.8 只按纯端口拼接这两个内部地址，遇到本项目用于限制回环监听的
+`127.0.0.1:8199` 会生成重复主机名的非法 URL。本项目通过
+`patches/subs-check-pro-v2.6.8-loopback-history.patch` 先从监听地址中提取端口，再生成
+`http://127.0.0.1:8199/...`，同时让内部订阅分类使用同一套端口规范化逻辑。这样既恢复
+上次成功与历史节点的复检，也不会把 WebUI 暴露到局域网。
+
+## 分析报告
+
+官方 v2.6.8 会在生成分析报告前清空逐订阅统计，表现为活跃订阅显示 `成功数 / 0`、
+成功率被放大 100 倍，并漏掉没有产出节点的沉默订阅。本项目通过
+`patches/subs-check-pro-v2.6.8-analysis-report.patch` 保留报告所需统计，并把零产出的
+订阅补入沉默列表；`patches/subs-check-pro-webui-b8db5f51c367-analysis-report.patch`
+让“含沉默订阅”显示数量，勾选时展开沉默列表并同步更新排名标题，复制 URL/YAML
+时也包含这些订阅。
+
+补丁不会重算已经落盘的旧报告。升级或首次应用后需要再运行一次节点检测，新的总数、
+成功率和沉默订阅列表才会写入 `runtime/output/stats/subs-analysis.yaml`。
+
+“沉默订阅”表示该订阅在本次检测中没有任何节点通过，不等于应该立刻删除。报告会把
+每次完整检测的结果累计到 `runtime/output/stats/subs-health-history.yaml`，并在沉默列表中
+显示“连续沉默 N 次”和“上次可用时间”：
+
+- 连续 1 次：视为临时异常。
+- 连续 2 次：继续观察。
+- 连续 3 次及以上：标记“建议核查/删除”，但不会自动删除订阅。
+- 后续任意一次有节点通过，连续沉默次数立即清零。
+- 手动中止或因 `success-limit` 提前结束的检测不计入历史，避免把没测完误判为沉默。
+
+报告同时区分 `0/0`（没有解析出可测节点）和 `0/N`（解析出 N 个节点，但全部没有通过）。
+历史从部署后的下一次完整检测开始累计，不会用旧报告反推过去的连续次数。
+
+普通订阅首轮仍使用上游默认 UA。只有首轮正文没有产生结构有效节点（`server`、`port`、
+`type` 均合法）时，
+`patches/subs-check-pro-v2.6.8-ua-fallback.patch` 才会依次使用 `clash.meta`、
+Clash Meta Android 和 `sing-box` UA 重新拉取，并在首次得到结构有效节点后停止。判断不再
+采用解析器的原始候选数，避免 HTML 中的客户端唤起链接或 Cloudflare 脚本被误认成畸形候选后
+阻断回退。这样可以恢复按 UA 返回不同订阅格式的来源，同时不会增加正常订阅或仅被
+`node-type` 过滤的订阅请求次数；GitHub Raw 地址也不会进行这种重复拉取。
 
 ## 管理命令
 

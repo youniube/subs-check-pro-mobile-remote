@@ -1,0 +1,69 @@
+diff --git a/webui/static/js/analysis.js b/webui/static/js/analysis.js
+index eec8aa1..adad6ec 100644
+--- a/webui/static/js/analysis.js
++++ b/webui/static/js/analysis.js
+@@ -1242,7 +1242,7 @@ function renderSubs(subs, subsBad, cfg) {
+     cfg = cfg || {};
+ 
+     // 复制工具栏
+-    document.getElementById('copyToolbar').innerHTML = subs.length
++    document.getElementById('copyToolbar').innerHTML = subs.length || subsBad.length
+         ? `<div class="copy-toolbar">
+         <span class="copy-toolbar-label">复制：</span>
+         <button class="copy-btn" id="copyUrlsBtn" onclick="copyUrls(false)" title="每行一个 URL">
+@@ -1254,9 +1254,9 @@ function renderSubs(subs, subsBad, cfg) {
+           <span class="btn-text">YAML 格式</span>
+         </button>
+         <div class="copy-scope">
+-          <label title="同时包含沉默订阅">
+-            <input type="checkbox" id="copyIncludeBad">
+-            <span class="scope-text">含沉默订阅</span>
++          <label title="复制时包含沉默订阅，并在下方展开显示">
++            <input type="checkbox" id="copyIncludeBad" onchange="toggleIncludeBad(this.checked)" ${subsBad.length ? '' : 'disabled'}>
++            <span class="scope-text">含沉默订阅 (${subsBad.length})</span>
+           </label>
+         </div>
+       </div>`
+@@ -1903,7 +1903,28 @@ function renderConfig(ci, ga, sr, sb, cfg) {
+         <div class="cfg-bottom-grid">${deployHTML}${suggestHTML}</div>`;
+ }
+ 
+-function toggleBad() { const list = document.getElementById('badList'), chevron = document.getElementById('badChevron'); const open = list.style.display === 'none'; list.style.display = open ? '' : 'none'; chevron.classList.toggle('open', open); }
++function setBadVisibility(open) {
++    const list = document.getElementById('badList'), chevron = document.getElementById('badChevron');
++    if (!list || !chevron) return;
++    list.style.display = open ? '' : 'none';
++    chevron.classList.toggle('open', open);
++}
++function toggleBad() {
++    const list = document.getElementById('badList');
++    if (!list) return;
++    setBadVisibility(list.style.display === 'none');
++}
++function toggleIncludeBad(include) {
++    const activeCount = _reportData?.subs_ranking?.length || 0;
++    const silentCount = _reportData?.subs_ranking_bad?.length || 0;
++    setBadVisibility(include && silentCount > 0);
++    const title = document.getElementById('rankingTitle');
++    if (title) {
++        title.textContent = include && silentCount > 0
++            ? `订阅排名（${activeCount} 个活跃 + ${silentCount} 个沉默）`
++            : `订阅排名（${activeCount} 个活跃）`;
++    }
++}
+ function esc(str) { return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+ 
+ async function writeClipboard(text) {
+diff --git a/webui/templates/analysis.html b/webui/templates/analysis.html
+index 2fd1e75..5437260 100644
+--- a/webui/templates/analysis.html
++++ b/webui/templates/analysis.html
+@@ -336,7 +336,7 @@
+     </footer>
+   </div>
+ 
+   <script type="module" src="/static/js/admin.js?v20260324"></script>
+-  <script src="/static/js/analysis.js?v20260324"></script>
++  <script src="/static/js/analysis.js?v20260719-analysis-fix"></script>
+   <script>
+     // 同步侧边栏主题图标与 topbar themeToggle 状态
