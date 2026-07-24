@@ -82,10 +82,20 @@ try {
 
     Push-Location -LiteralPath $buildDir
     try {
-        $webuiModuleOutput = & go list -m -f '{{.Dir}}' github.com/sinspired/subs-check-pro-webui
-        $webuiListExitCode = $LASTEXITCODE
-        $webuiModule = (($webuiModuleOutput | Out-String).Trim())
-        if ($webuiListExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($webuiModule) -or -not (Test-Path -LiteralPath $webuiModule -PathType Container)) {
+        # `go list -m` can return an empty .Dir when the module cache is clean.
+        # Download the selected go.mod version explicitly and use its JSON Dir.
+        $webuiDownloadOutput = (& go mod download -json github.com/sinspired/subs-check-pro-webui 2>&1 | Out-String).Trim()
+        $webuiDownloadExitCode = $LASTEXITCODE
+        if ($webuiDownloadExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($webuiDownloadOutput)) {
+            throw "WebUI module download failed: $webuiDownloadOutput"
+        }
+        try {
+            $webuiModuleInfo = $webuiDownloadOutput | ConvertFrom-Json
+        } catch {
+            throw "WebUI module download returned invalid JSON: $webuiDownloadOutput"
+        }
+        $webuiModule = [string]$webuiModuleInfo.Dir
+        if ($webuiModuleInfo.Error -or [string]::IsNullOrWhiteSpace($webuiModule) -or -not (Test-Path -LiteralPath $webuiModule -PathType Container)) {
             throw 'WebUI module lookup failed'
         }
         $webuiDir = Join-Path $buildDir '_webui'
