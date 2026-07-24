@@ -19,4 +19,5 @@
 - 安装：`powershell -ExecutionPolicy Bypass -File .\scripts\install-current-user.ps1`
 - 启动：`powershell -ExecutionPolicy Bypass -File .\scripts\start.ps1`
 - 测试：`powershell -ExecutionPolicy Bypass -File .\scripts\verify.ps1`
-- 构建：不适用（使用官方校验过的 Windows x86_64 Release）
+- 构建核心：`powershell -ExecutionPolicy Bypass -File .\scripts\build-custom-core.ps1`
+- 构建便携包：`powershell -ExecutionPolicy Bypass -File .\scripts\build-portable-package.ps1`

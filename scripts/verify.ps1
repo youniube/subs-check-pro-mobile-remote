@@ -14,6 +14,7 @@ $historyPatch = Join-Path $workspace 'patches\subs-check-pro-v2.6.8-subscription
 $webuiHistoryPatch = Join-Path $workspace 'patches\subs-check-pro-webui-b8db5f51c367-subscription-history.patch'
 $uaFallbackPatch = Join-Path $workspace 'patches\subs-check-pro-v2.6.8-ua-fallback.patch'
 $loopbackHistoryPatch = Join-Path $workspace 'patches\subs-check-pro-v2.6.8-loopback-history.patch'
+$cleanInternalTagsPatch = Join-Path $workspace 'patches\subs-check-pro-v2.6.8-clean-internal-tags.patch'
 $failures = New-Object System.Collections.Generic.List[string]
 
 function Test-RequiredPath {
@@ -37,6 +38,7 @@ Test-RequiredPath -Path $historyPatch -Label 'Subscription history core patch ex
 Test-RequiredPath -Path $webuiHistoryPatch -Label 'Subscription history WebUI patch exists'
 Test-RequiredPath -Path $uaFallbackPatch -Label 'Subscription UA fallback patch exists'
 Test-RequiredPath -Path $loopbackHistoryPatch -Label 'Loopback history replay patch exists'
+Test-RequiredPath -Path $cleanInternalTagsPatch -Label 'Internal source tag cleanup patch exists'
 
 try {
     $uaPatchText = [IO.File]::ReadAllText($uaFallbackPatch)
@@ -75,6 +77,24 @@ try {
 } catch {
     Write-Output "[FAIL] Loopback history verification failed: $($_.Exception.Message)"
     $failures.Add('Loopback history replay')
+}
+
+try {
+    $cleanTagsPatchText = [IO.File]::ReadAllText($cleanInternalTagsPatch)
+    foreach ($signature in @(
+        'if isLatest || isHistory',
+        'tag = ""',
+        'ordinary subscription tag',
+        'wantTag:  "Custom"'
+    )) {
+        if (-not $cleanTagsPatchText.Contains($signature)) {
+            throw "Internal tag cleanup signature is missing: $signature"
+        }
+    }
+    Write-Output '[OK] Internal Succeed/History tags are excluded from exported names'
+} catch {
+    Write-Output "[FAIL] Internal tag cleanup verification failed: $($_.Exception.Message)"
+    $failures.Add('Internal source tag cleanup')
 }
 
 try {
@@ -198,7 +218,7 @@ if (Test-Path -LiteralPath $historyReport -PathType Leaf) {
 try {
     $versionInfo = Invoke-RestMethod -UseBasicParsing `
         -Uri 'http://127.0.0.1:8199/admin/version' -TimeoutSec 8
-    if ($versionInfo.version -ne 'v2.6.8+custom.history.ua2.loopback1') {
+    if ($versionInfo.version -ne 'v2.6.8+custom.history.ua2.loopback1.cleantags1') {
         throw "Unexpected active version: $($versionInfo.version)"
     }
     Write-Output '[OK] Active version uses non-prerelease custom metadata'
