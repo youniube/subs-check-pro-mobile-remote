@@ -4,13 +4,15 @@ param()
 $ErrorActionPreference = 'Stop'
 $workspace = Split-Path -Parent $PSScriptRoot
 $upstreamVersion = 'v2.6.8'
+$upstreamSourceCommit = '3c5468962e4364c3d5a61b53d90baf10385ea198'
 $upstreamCommit = '5fe3a39'
 $corePatches = @(
     (Join-Path $workspace 'patches\subs-check-pro-v2.6.8-custom-rename.patch'),
     (Join-Path $workspace 'patches\subs-check-pro-v2.6.8-analysis-report.patch'),
     (Join-Path $workspace 'patches\subs-check-pro-v2.6.8-subscription-history.patch'),
     (Join-Path $workspace 'patches\subs-check-pro-v2.6.8-ua-fallback.patch'),
-    (Join-Path $workspace 'patches\subs-check-pro-v2.6.8-loopback-history.patch')
+    (Join-Path $workspace 'patches\subs-check-pro-v2.6.8-loopback-history.patch'),
+    (Join-Path $workspace 'patches\subs-check-pro-v2.6.8-clean-internal-tags.patch')
 )
 $webuiPatches = @(
     (Join-Path $workspace 'patches\subs-check-pro-webui-b8db5f51c367-analysis-report.patch'),
@@ -38,22 +40,38 @@ try {
     $ErrorActionPreference = 'Continue'
     # The upstream repository stores about 300 MB of embedded Node binaries.
     # Fetch only the Windows amd64 asset required by this build.
-    & git -c 'http.sslBackend=openssl' clone --filter=blob:none --no-checkout --branch $upstreamVersion --depth 1 'https://github.com/sinspired/subs-check-pro.git' $buildDir
-    $cloneExitCode = $LASTEXITCODE
+    & git init --quiet $buildDir
+    $initExitCode = $LASTEXITCODE
     $ErrorActionPreference = 'Stop'
-    if ($null -eq $cloneExitCode -or $cloneExitCode -ne 0) {
-        throw "git clone failed with exit code $cloneExitCode"
+    if ($null -eq $initExitCode -or $initExitCode -ne 0) {
+        throw "git init failed with exit code $initExitCode"
     }
 
+    & git -C $buildDir remote add origin 'https://github.com/sinspired/subs-check-pro.git'
+    if ($LASTEXITCODE -ne 0) { throw 'Git upstream remote configuration failed' }
     & git -C $buildDir config http.sslBackend openssl
     if ($LASTEXITCODE -ne 0) { throw 'Git OpenSSL backend configuration failed' }
+
+    # v2.6.8 is an annotated tag. A filtered shallow clone can fetch only the tag
+    # object on a clean runner, so fetch the immutable peeled commit explicitly.
+    $ErrorActionPreference = 'Continue'
+    & git -C $buildDir fetch --quiet --filter=blob:none --depth 1 origin $upstreamSourceCommit
+    $fetchExitCode = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    if ($null -eq $fetchExitCode -or $fetchExitCode -ne 0) {
+        throw "Git upstream source fetch failed with exit code $fetchExitCode"
+    }
 
     & git -C $buildDir sparse-checkout init --no-cone
     if ($LASTEXITCODE -ne 0) { throw 'sparse checkout initialization failed' }
     & git -C $buildDir sparse-checkout set '/*' '!/assets/node_*' '/assets/node_windows_amd64.zst' '!/doc/' '!/docs-site/'
     if ($LASTEXITCODE -ne 0) { throw 'sparse checkout configuration failed' }
-    & git -C $buildDir checkout --quiet $upstreamVersion
+    & git -C $buildDir checkout --detach --quiet FETCH_HEAD
     if ($LASTEXITCODE -ne 0) { throw 'sparse checkout failed' }
+    $checkedOutCommit = ((& git -C $buildDir rev-parse HEAD) | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $checkedOutCommit -ne $upstreamSourceCommit) {
+        throw "Unexpected upstream source commit: $checkedOutCommit"
+    }
 
     foreach ($patch in $corePatches) {
         & git -C $buildDir apply --check $patch
@@ -64,8 +82,20 @@ try {
 
     Push-Location -LiteralPath $buildDir
     try {
-        $webuiModule = (& go list -m -f '{{.Dir}}' github.com/sinspired/subs-check-pro-webui).Trim()
-        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $webuiModule -PathType Container)) {
+        # `go list -m` can return an empty .Dir when the module cache is clean.
+        # Download the selected go.mod version explicitly and use its JSON Dir.
+        $webuiDownloadOutput = (& go mod download -json github.com/sinspired/subs-check-pro-webui 2>&1 | Out-String).Trim()
+        $webuiDownloadExitCode = $LASTEXITCODE
+        if ($webuiDownloadExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($webuiDownloadOutput)) {
+            throw "WebUI module download failed: $webuiDownloadOutput"
+        }
+        try {
+            $webuiModuleInfo = $webuiDownloadOutput | ConvertFrom-Json
+        } catch {
+            throw "WebUI module download returned invalid JSON: $webuiDownloadOutput"
+        }
+        $webuiModule = [string]$webuiModuleInfo.Dir
+        if ($webuiModuleInfo.Error -or [string]::IsNullOrWhiteSpace($webuiModule) -or -not (Test-Path -LiteralPath $webuiModule -PathType Container)) {
             throw 'WebUI module lookup failed'
         }
         $webuiDir = Join-Path $buildDir '_webui'
@@ -82,8 +112,13 @@ try {
         & go mod edit '-replace=github.com/sinspired/subs-check-pro-webui=./_webui'
         if ($LASTEXITCODE -ne 0) { throw 'WebUI module replacement failed' }
 
-        & go test ./proxy ./check
-        if ($LASTEXITCODE -ne 0) { throw 'Go tests failed' }
+        # Upstream ISP tests call ipapi.is directly and fail when that third-party
+        # service is slow or unavailable. Keep the deterministic proxy tests,
+        # including local-history tag behavior, in the build gate.
+        & go test ./proxy -skip 'Test(CurrentIP|SpecificIP|GetISPInfo)$'
+        if ($LASTEXITCODE -ne 0) { throw 'Proxy tests failed' }
+        & go test ./check
+        if ($LASTEXITCODE -ne 0) { throw 'Check tests failed' }
 
         $goBin = Join-Path (& go env GOPATH) 'bin'
         $winres = Join-Path $goBin 'go-winres.exe'
@@ -101,10 +136,12 @@ try {
 
         $built = Join-Path $buildDir 'subs-check-pro-custom.exe'
         & go build -trimpath `
-            -ldflags ("-s -w -X main.Version=$upstreamVersion+custom.history.ua2.loopback1 -X main.CurrentCommit=$upstreamCommit-custom") `
+            -ldflags ("-s -w -X main.Version=$upstreamVersion+custom.history.ua2.loopback1.cleantags1 -X main.CurrentCommit=$upstreamCommit-custom") `
             -o $built .
         if ($LASTEXITCODE -ne 0) { throw 'go build failed' }
 
+        $destinationDirectory = Split-Path -Parent $destination
+        New-Item -ItemType Directory -Path $destinationDirectory -Force | Out-Null
         Copy-Item -LiteralPath $built -Destination $destination -Force
         Get-FileHash -LiteralPath $destination -Algorithm SHA256
     } finally {

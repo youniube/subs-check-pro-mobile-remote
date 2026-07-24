@@ -3,6 +3,7 @@ runtime/bin/
 runtime/logs/
 runtime/output/
 runtime/*.lock
+dist/
 
 # Credentials and machine-specific configuration
 runtime/config/config.yaml

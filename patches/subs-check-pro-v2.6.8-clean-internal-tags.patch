@@ -1,0 +1,58 @@
+diff --git a/proxy/proxies.go b/proxy/proxies.go
+index ef3ea6a..b8a4c32 100644
+--- a/proxy/proxies.go
++++ b/proxy/proxies.go
+@@ -584,6 +584,12 @@ func identifyLocalSubType(subURL, listenPort, storePort string) (isLatest, isHi
+ 	path := u.Path
+ 	isLatest = strings.HasSuffix(path, "/all.yaml") || strings.HasSuffix(path, "/all.yml")
+ 	isHistory = strings.HasSuffix(path, "/history.yaml") || strings.HasSuffix(path, "/history.yml")
++
++	// Succeed and History are internal source markers used only to preserve
++	// deduplication priority. They must not leak into exported proxy names.
++	if isLatest || isHistory {
++		tag = ""
++	}
+ 
+ 	return isLatest, isHistory, tag
+ }
+diff --git a/proxy/local_subscription_test.go b/proxy/local_subscription_test.go
+index 7b9b3df..de756cc 100644
+--- a/proxy/local_subscription_test.go
++++ b/proxy/local_subscription_test.go
+@@ -38,6 +38,7 @@ func TestIdentifyLocalSubTypeWithQualifiedConfiguredPort(t *testing.T) {
+ 	storePort := normalizeListenPort("8299")
+ 
+ 	tests := []struct {
++		name        string
+ 		url         string
+ 		wantLatest  bool
+ 		wantHistory bool
+@@ -45,18 +46,25 @@ func TestIdentifyLocalSubTypeWithQualifiedConfiguredPort(t *testing.T) {
+ 	}{
+ 		{
++			name:       "latest internal source",
+ 			url:        "http://127.0.0.1:8199/all.yaml#Succeed",
+ 			wantLatest: true,
+-			wantTag:    "Succeed",
++			wantTag:    "",
+ 		},
+ 		{
++			name:        "history internal source",
+ 			url:         "http://127.0.0.1:8199/history.yaml#History",
+ 			wantHistory: true,
+-			wantTag:     "History",
++			wantTag:     "",
++		},
++		{
++			name:     "ordinary subscription tag",
++			url:      "https://example.com/sub.yaml#Custom",
++			wantTag:  "Custom",
+ 		},
+ 	}
+ 
+ 	for _, test := range tests {
+-		t.Run(test.wantTag, func(t *testing.T) {
++		t.Run(test.name, func(t *testing.T) {
+ 			latest, history, tag := identifyLocalSubType(test.url, listenPort, storePort)
+ 			if latest != test.wantLatest || history != test.wantHistory || tag != test.wantTag {
+ 				t.Fatalf("identifyLocalSubType() = (%v, %v, %q), want (%v, %v, %q)",

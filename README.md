@@ -2,6 +2,18 @@
 
 本机运行 subs-check-pro，手机通过 Cloudflare Tunnel 添加订阅、启动测速并查看结果。
 
+## Windows 便携包
+
+GitHub Actions 会在 Pull Request、`main` 更新、手动触发或推送 `portable-v*` 标签时，
+自动构建 `subs-check-pro-portable-windows-amd64.zip`。普通构建可以在 Actions 页面下载
+并保留 30 天；`portable-v*` 标签构建还会把压缩包和 SHA256 文件发布到 GitHub Releases。
+
+便携包已经包含打好项目补丁的核心、校验过的 cloudflared、配置模板和首次初始化脚本，
+新电脑不需要安装 Git、Go 或 Node.js。解压到固定目录后双击 `setup.cmd`，再按提示选择
+本机模式或提供 Cloudflare Tunnel 凭据。详细步骤见 `README-PORTABLE.md`。
+
+构建包采用文件白名单，不包含 `config.yaml`、订阅、API Key、Tunnel 凭据、测速结果或日志。
+
 ## 仓库范围
 
 仓库只保存部署脚本、脱敏配置模板和自定义核心补丁。以下内容被 `.gitignore`
@@ -19,6 +31,13 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build-custom-core.ps1
 随后填写本机路径和凭据，把构建出的自定义核心复制为
 `runtime\bin\subs-check-pro.exe`，并把 `cloudflared.exe` 和 Tunnel 凭据放入
 模板约定的位置。真实配置只能保留在本机。
+
+本地复现便携包：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build-custom-core.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\build-portable-package.ps1
+```
 
 ## 日常使用
 
@@ -59,6 +78,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build-custom-core.ps1
 `patches/subs-check-pro-v2.6.8-loopback-history.patch` 先从监听地址中提取端口，再生成
 `http://127.0.0.1:8199/...`，同时让内部订阅分类使用同一套端口规范化逻辑。这样既恢复
 上次成功与历史节点的复检，也不会把 WebUI 暴露到局域网。
+
+核心内部使用 URL 片段 `Succeed` 和 `History` 区分上次成功节点与历史节点，并据此决定
+去重优先级；`patches/subs-check-pro-v2.6.8-clean-internal-tags.patch` 保留该内部优先级，
+但不再把两个内部标签追加到最终节点名称。普通订阅链接中用户自定义的 URL 片段标签不受影响。
 
 ## 分析报告
 
