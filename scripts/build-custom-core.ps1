@@ -4,6 +4,7 @@ param()
 $ErrorActionPreference = 'Stop'
 $workspace = Split-Path -Parent $PSScriptRoot
 $upstreamVersion = 'v2.6.8'
+$upstreamSourceCommit = '3c5468962e4364c3d5a61b53d90baf10385ea198'
 $upstreamCommit = '5fe3a39'
 $corePatches = @(
     (Join-Path $workspace 'patches\subs-check-pro-v2.6.8-custom-rename.patch'),
@@ -39,22 +40,38 @@ try {
     $ErrorActionPreference = 'Continue'
     # The upstream repository stores about 300 MB of embedded Node binaries.
     # Fetch only the Windows amd64 asset required by this build.
-    & git -c 'http.sslBackend=openssl' clone --filter=blob:none --no-checkout --branch $upstreamVersion --depth 1 'https://github.com/sinspired/subs-check-pro.git' $buildDir
-    $cloneExitCode = $LASTEXITCODE
+    & git init --quiet $buildDir
+    $initExitCode = $LASTEXITCODE
     $ErrorActionPreference = 'Stop'
-    if ($null -eq $cloneExitCode -or $cloneExitCode -ne 0) {
-        throw "git clone failed with exit code $cloneExitCode"
+    if ($null -eq $initExitCode -or $initExitCode -ne 0) {
+        throw "git init failed with exit code $initExitCode"
     }
 
+    & git -C $buildDir remote add origin 'https://github.com/sinspired/subs-check-pro.git'
+    if ($LASTEXITCODE -ne 0) { throw 'Git upstream remote configuration failed' }
     & git -C $buildDir config http.sslBackend openssl
     if ($LASTEXITCODE -ne 0) { throw 'Git OpenSSL backend configuration failed' }
+
+    # v2.6.8 is an annotated tag. A filtered shallow clone can fetch only the tag
+    # object on a clean runner, so fetch the immutable peeled commit explicitly.
+    $ErrorActionPreference = 'Continue'
+    & git -C $buildDir fetch --quiet --filter=blob:none --depth 1 origin $upstreamSourceCommit
+    $fetchExitCode = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    if ($null -eq $fetchExitCode -or $fetchExitCode -ne 0) {
+        throw "Git upstream source fetch failed with exit code $fetchExitCode"
+    }
 
     & git -C $buildDir sparse-checkout init --no-cone
     if ($LASTEXITCODE -ne 0) { throw 'sparse checkout initialization failed' }
     & git -C $buildDir sparse-checkout set '/*' '!/assets/node_*' '/assets/node_windows_amd64.zst' '!/doc/' '!/docs-site/'
     if ($LASTEXITCODE -ne 0) { throw 'sparse checkout configuration failed' }
-    & git -C $buildDir checkout --quiet $upstreamVersion
+    & git -C $buildDir checkout --detach --quiet FETCH_HEAD
     if ($LASTEXITCODE -ne 0) { throw 'sparse checkout failed' }
+    $checkedOutCommit = ((& git -C $buildDir rev-parse HEAD) | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $checkedOutCommit -ne $upstreamSourceCommit) {
+        throw "Unexpected upstream source commit: $checkedOutCommit"
+    }
 
     foreach ($patch in $corePatches) {
         & git -C $buildDir apply --check $patch
@@ -65,8 +82,10 @@ try {
 
     Push-Location -LiteralPath $buildDir
     try {
-        $webuiModule = (& go list -m -f '{{.Dir}}' github.com/sinspired/subs-check-pro-webui).Trim()
-        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $webuiModule -PathType Container)) {
+        $webuiModuleOutput = & go list -m -f '{{.Dir}}' github.com/sinspired/subs-check-pro-webui
+        $webuiListExitCode = $LASTEXITCODE
+        $webuiModule = (($webuiModuleOutput | Out-String).Trim())
+        if ($webuiListExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($webuiModule) -or -not (Test-Path -LiteralPath $webuiModule -PathType Container)) {
             throw 'WebUI module lookup failed'
         }
         $webuiDir = Join-Path $buildDir '_webui'
