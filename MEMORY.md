@@ -42,6 +42,7 @@
 - Git partial clone 的 `-c http.sslBackend=openssl` 只影响 clone 命令，不会自动传给后续 sparse checkout 的 promisor fetch；构建脚本现在会在临时仓库中持久设置 OpenSSL backend，避免 Windows PowerShell 无交互环境再次落回 schannel 并报凭据错误。
 - 上游 `v2.6.8` 是注释标签；在干净 GitHub Actions runner 上使用 `--filter=blob:none --depth 1 --branch v2.6.8` 可能只取得标签对象而没有实际提交。构建脚本现固定拉取该标签剥离后的提交 `3c5468962e4364c3d5a61b53d90baf10385ea198`，并在应用补丁前核对 HEAD，以保证便携包构建可复现。
 - 干净 Go 模块缓存中，`go list -m -f '{{.Dir}}'` 不会保证依赖已下载，可能返回空目录；构建脚本需先用 `go mod download -json` 下载 go.mod 选定的 WebUI 版本并读取其 `Dir`。该路径已用全新 `GOPATH`、`GOMODCACHE` 与 `GOCACHE` 完整构建验证。
+- `runtime/bin` 被 Git 忽略，GitHub Actions 的干净检出不会包含该目录；核心构建脚本必须在复制 EXE 前自行创建目标目录，不能依赖开发机已有的运行目录。
 - 上游 `proxy/isp_test.go` 的 3 个测试会直接访问 `ipapi.is`，第三方接口超时会让本地构建误报失败；构建门禁跳过这 3 个外部网络测试，仍运行其余 `proxy` 与全部 `check` 测试，包括内部标签清理回归测试。
 - `keep-success-proxies: true` 会自动把已有的 `runtime/output/sub/all.yaml` 与 `history.yaml` 作为内部订阅重新检测，用户无需手工添加。上游 v2.6.8 只兼容纯端口或 `:端口`，却把本项目用于限制回环监听的 `listen-port: "127.0.0.1:8199"` 直接拼到 `http://127.0.0.1:` 后，生成非法的重复主机名 URL。现已通过 `patches/subs-check-pro-v2.6.8-loopback-history.patch` 统一提取 WebUI 与 Sub-Store 的数值端口，并固定用 IPv4 回环生成内部 URL；这既恢复上次成功与历史节点复检及其优先级标记，也保持 WebUI 只监听回环地址。
 - 2026-07-24 确认：回环历史修复从 2026-07-22 10:42 启用后，`keep-success-proxies` 的内部复检分支开始真正执行；上游会给来自 `all.yaml` 和 `history.yaml` 的节点名分别追加 `|Succeed`、`|History`，这些内部优先级标签会泄漏到最终 `all.yaml`。该标签不是机场原名，也不是测速状态；如要保留历史复检能力，应在最终保存前剥离标签，而不是关闭 `keep-success-proxies`。

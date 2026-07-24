@@ -140,6 +140,8 @@ try {
             -o $built .
         if ($LASTEXITCODE -ne 0) { throw 'go build failed' }
 
+        $destinationDirectory = Split-Path -Parent $destination
+        New-Item -ItemType Directory -Path $destinationDirectory -Force | Out-Null
         Copy-Item -LiteralPath $built -Destination $destination -Force
         Get-FileHash -LiteralPath $destination -Algorithm SHA256
     } finally {
