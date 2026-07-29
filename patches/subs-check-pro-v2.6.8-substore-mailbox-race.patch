@@ -1,0 +1,18 @@
+diff --git a/app/substore_manager.go b/app/substore_manager.go
+index 01626f2..9e90a3f 100644
+--- a/app/substore_manager.go
++++ b/app/substore_manager.go
+@@ -112,7 +112,12 @@ func (manager *subStoreManager) Submit(spec assets.SubStoreRuntimeSpec, version
+ 	select {
+ 	case manager.requests <- request:
+ 	default:
+-		<-manager.requests
++		// The manager may consume the queued request after the failed send.
++		// Keep this discard non-blocking so Submit never waits on an empty mailbox.
++		select {
++		case <-manager.requests:
++		default:
++		}
+ 		manager.requests <- request
+ 	}
+ }

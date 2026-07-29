@@ -1,0 +1,994 @@
+diff --git a/app/app.go b/app/app.go
+index 9db3c92..269f847 100644
+--- a/app/app.go
++++ b/app/app.go
+@@ -47,17 +47,19 @@ type App struct {
+ 	// appliedTimerCron/appliedTimerInterval record what the running scheduler
+ 	// actually uses. Config reload decisions must compare against these values
+ 	// rather than GlobalConfig, which may already contain newly loaded values.
+-	appliedTimerCron     atomic.Value
+-	appliedTimerInterval atomic.Int64
+-	configReloadMu       sync.Mutex
+-	configVersion        atomic.Uint64
+-	appliedConfigVersion atomic.Uint64
+-	checkConfigVersion   atomic.Uint64
+-	desiredConfig        *config.Config
+-	appliedConfig        *config.Config
+-	pendingConfig        *config.Config
+-	pendingConfigVersion uint64
+-	startupConfig        *config.Config
++	appliedTimerCron      atomic.Value
++	appliedTimerInterval  atomic.Int64
++	configReloadMu        sync.Mutex
++	configVersion         atomic.Uint64
++	appliedConfigVersion  atomic.Uint64
++	checkConfigVersion    atomic.Uint64
++	desiredConfig         *config.Config
++	appliedConfig         *config.Config
++	pendingConfig         *config.Config
++	pendingConfigVersion  uint64
++	startupConfig         *config.Config
++	subStoreManager       *subStoreManager
++	subStoreGeneratedPath string
+ 	// updateCron 版本更新定时任务调度器，独立存储以便 SetupUpdateTasks 重调时先停止旧实例，
+ 	// 避免每次配置变更触发重建时 goroutine 持续累积。
+ 	updateCron    *cron.Cron
+@@ -88,7 +90,7 @@ type lastCheckResult struct {
+ func New(originVersion string, version string, configPath string) *App {
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 
+-	return &App{
++	app := &App{
+ 		ctx:           ctx,
+ 		cancel:        cancel,
+ 		configPath:    configPath,
+@@ -97,6 +99,8 @@ func New(originVersion string, version string, configPath string) *App {
+ 		version:       version,
+ 		originVersion: originVersion,
+ 	}
++	app.subStoreManager = newSubStoreManager(assets.RunSubStoreService, assets.KillNode)
++	return app
+ }
+ 
+ func normalizedCheckInterval(interval int) int {
+@@ -166,25 +170,23 @@ func (app *App) Initialize() error {
+ 		}
+ 	}
+ 
+-	if config.GlobalConfig.SubStorePort != "" {
+-		if runtime.GOOS == "linux" && runtime.GOARCH == "386" {
+-			slog.Warn("Node.js 不支持 Linux 32位架构，Sub-Store 服务未启动")
+-		} else {
+-			subStoreAddr := normalizeListenAddr(config.GlobalConfig.SubStorePort)
+-			if !subStorePortAvailable {
+-				assets.IsSubStoreRunning.Store(false)
+-				slog.Warn("Sub-Store 端口已被其他进程占用，Sub-Store 服务未启动，请修改端口后重启",
+-					"addr", subStoreAddr)
+-			} else {
+-				// 使用 app.ctx 启动 sub-store，让其可被取消
+-				go assets.RunSubStoreService(app.ctx)
+-				// 短暂等待，保证 sub-store 启动日志按预期顺序输出
+-				time.Sleep(500 * time.Millisecond)
+-			}
+-		}
+-	} else {
++	app.configReloadMu.Lock()
++	subStoreSpec := app.subStoreSpecLocked(config.GlobalConfig)
++	subStoreVersion := app.appliedConfigVersion.Load()
++	if app.appliedConfig != nil {
++		app.appliedConfig.SubStorePath = subStoreSpec.Path
++	}
++	app.configReloadMu.Unlock()
++	if runtime.GOOS == "linux" && runtime.GOARCH == "386" {
++		slog.Warn("Node.js 不支持 Linux 32位架构，Sub-Store 服务未启动")
++		subStoreSpec.Port = ""
++	} else if subStoreSpec.Port != "" && !subStorePortAvailable {
++		slog.Warn("Sub-Store 端口当前被其他进程占用，管理器将保留期望配置并持续报告状态",
++			"addr", normalizeListenAddr(subStoreSpec.Port))
++	}
++	app.subStoreManager.Submit(subStoreSpec, subStoreVersion)
++	if subStoreSpec.Port == "" {
+ 		slog.Warn("Sub-store 服务已禁用", "port", "未设置")
+-		assets.IsSubStoreRunning.Store(false)
+ 	}
+ 
+ 	// 启动内存监控
+@@ -510,6 +512,17 @@ func (app *App) Shutdown() error {
+ 		app.watcherCancel()
+ 	}
+ 
++	// Sub-Store has its own lifecycle context. Stop and join its manager before
++	// canceling the remaining application services so no Node child is orphaned.
++	if app.subStoreManager != nil {
++		subStoreStopCtx, subStoreStopCancel := context.WithTimeout(context.Background(), 5*time.Second)
++		if err := app.subStoreManager.Close(subStoreStopCtx); err != nil {
++			lastErr = err
++			slog.Error("关闭 Sub-Store 管理器失败", "err", err)
++		}
++		subStoreStopCancel()
++	}
++
+ 	// 取消上下文，通知各子服务退出（sub-store 等）
+ 	if app.cancel != nil {
+ 		app.cancel()
+diff --git a/app/config.go b/app/config.go
+index 5edc59e..99f0fbf 100644
+--- a/app/config.go
++++ b/app/config.go
+@@ -11,7 +11,6 @@ import (
+ 
+ 	"github.com/fsnotify/fsnotify"
+ 	"github.com/goccy/go-yaml"
+-	"github.com/sinspired/subs-check-pro/v2/assets"
+ 	"github.com/sinspired/subs-check-pro/v2/config"
+ 	"github.com/sinspired/subs-check-pro/v2/utils"
+ )
+@@ -59,12 +58,14 @@ func (app *App) loadConfig() error {
+ 
+ 	app.configReloadMu.Lock()
+ 	defer app.configReloadMu.Unlock()
+-	*config.GlobalConfig = *cloneConfig(newConfig)
+ 	app.desiredConfig = cloneConfig(newConfig)
+-	app.appliedConfig = cloneConfig(newConfig)
+ 	if app.startupConfig == nil {
+ 		app.startupConfig = cloneConfig(newConfig)
+ 	}
++	runtimeConfig := cloneConfig(newConfig)
++	runtimeConfig.SubStorePath = app.normalizeSubStorePathLocked(runtimeConfig.SubStorePath)
++	*config.GlobalConfig = *runtimeConfig
++	app.appliedConfig = cloneConfig(runtimeConfig)
+ 	if app.configVersion.Load() == 0 {
+ 		app.configVersion.Store(1)
+ 		app.appliedConfigVersion.Store(1)
+@@ -284,8 +285,6 @@ func (app *App) onConfigChange() (configApplyStatus, error) {
+ func (app *App) applyRuntimeConfigLocked(nextConfig *config.Config, version uint64) {
+ 	oldUpdateSwitcher := config.GlobalConfig.EnableSelfUpdate
+ 	oldCronCheckUpdateExpr := config.GlobalConfig.CronCheckUpdate
+-	oldSubStorePath := config.GlobalConfig.SubStorePath
+-	oldSubStorePort := config.GlobalConfig.SubStorePort
+ 
+ 	effectiveConfig := app.effectiveConfigLocked(nextConfig)
+ 	*config.GlobalConfig = *effectiveConfig
+@@ -318,75 +317,7 @@ func (app *App) applyRuntimeConfigLocked(nextConfig *config.Config, version uint
+ 		}
+ 	}
+ 
+-	switch {
+-	case oldSubStorePort != "" && config.GlobalConfig.SubStorePort != "" && oldSubStorePort != config.GlobalConfig.SubStorePort:
+-		// 端口变更 → 重启
+-		slog.Debug("重启 sub-store（端口变更）")
+-		if app.cancel != nil && !app.checking.Load() {
+-			app.cancel()
+-			time.Sleep(500 * time.Millisecond)
+-			if err := assets.KillNode(); err != nil {
+-				slog.Error("强制清理 node 失败", "err", err)
+-			}
+-			app.ctx, app.cancel = context.WithCancel(context.Background())
+-		}
+-		assets.RunSubStoreService(app.ctx)
+-
+-	case oldSubStorePort == "" && config.GlobalConfig.SubStorePort != "":
+-		// 首次配置端口 → 启动
+-		slog.Debug("启动 sub-store")
+-		assets.RunSubStoreService(app.ctx)
+-
+-	case oldSubStorePort != "" && config.GlobalConfig.SubStorePort == "":
+-		// 端口被清空 → 停止
+-		slog.Debug("停止 sub-store（端口已清空）")
+-		if app.cancel != nil && !app.checking.Load() {
+-			app.cancel()
+-			app.ctx, app.cancel = context.WithCancel(context.Background())
+-		}
+-	}
+-
+-	// 去掉开头斜杠以进行比对
+-	oldSubStorePath = strings.TrimPrefix(oldSubStorePath, "/")
+-	config.GlobalConfig.SubStorePath = strings.TrimPrefix(config.GlobalConfig.SubStorePath, "/")
+-
+-	// 如果sub-store路径变化，重启sub-store服务
+-	if config.GlobalConfig.SubStorePath == "" {
+-		if subStorePath := os.Getenv("SUB_STORE_PATH"); subStorePath != "" {
+-			if subStorePath != oldSubStorePath {
+-				slog.Info("从环境变量获取sub-store路径", "sub-store-path", subStorePath)
+-				config.GlobalConfig.SubStorePath = subStorePath
+-				// 重启sub-store服务
+-				if app.cancel != nil {
+-					app.cancel()
+-					app.ctx, app.cancel = context.WithCancel(context.Background())
+-				}
+-				assets.RunSubStoreService(app.ctx)
+-			}
+-		} else {
+-			if assets.InitSubStorePath != "" {
+-				slog.Warn("sub-store路径发生变化，正在重启sub-store服务")
+-				config.GlobalConfig.SubStorePath = utils.GenerateRandomString(20)
+-				slog.Info("已随机生成", "sub-store-path", config.GlobalConfig.SubStorePath)
+-
+-				if app.cancel != nil {
+-					app.cancel()
+-					app.ctx, app.cancel = context.WithCancel(context.Background())
+-				}
+-				assets.RunSubStoreService(app.ctx)
+-			} else {
+-				config.GlobalConfig.SubStorePath = oldSubStorePath
+-				slog.Debug("保留首次运行自动生成的sub-store路径", "sub-store-path", config.GlobalConfig.SubStorePath)
+-			}
+-		}
+-	} else if oldSubStorePath != config.GlobalConfig.SubStorePath {
+-		slog.Warn("sub-store路径发生变化，正在重启sub-store服务")
+-		if app.cancel != nil {
+-			app.cancel()
+-			app.ctx, app.cancel = context.WithCancel(context.Background())
+-		}
+-		assets.RunSubStoreService(app.ctx)
+-	}
++	subStoreSpec := app.subStoreSpecLocked(config.GlobalConfig)
+ 
+ 	// Compare the desired configuration with the scheduler that is actually
+ 	// running. Comparing old/new GlobalConfig values can miss a change when a
+@@ -405,5 +336,8 @@ func (app *App) applyRuntimeConfigLocked(nextConfig *config.Config, version uint
+ 
+ 	app.appliedConfig = cloneConfig(config.GlobalConfig)
+ 	app.appliedConfigVersion.Store(version)
++	if app.subStoreManager != nil {
++		app.subStoreManager.Submit(subStoreSpec, version)
++	}
+ 	slog.Info("运行配置已应用", "config-version", version)
+ }
+diff --git a/app/config_reload_test.go b/app/config_reload_test.go
+index d4d79dd..5e5d80c 100644
+--- a/app/config_reload_test.go
++++ b/app/config_reload_test.go
+@@ -1,9 +1,11 @@
+ package app
+ 
+ import (
++	"context"
+ 	"os"
+ 	"path/filepath"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/sinspired/subs-check-pro/v2/config"
+ )
+@@ -33,6 +35,11 @@ func TestConfigReloadRepairsStaleCronTimer(t *testing.T) {
+ 	app.interval = normalizedCheckInterval(config.GlobalConfig.CheckInterval)
+ 	app.setTimer()
+ 	t.Cleanup(func() {
++		if app.subStoreManager != nil {
++			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++			_ = app.subStoreManager.Close(ctx)
++			cancel()
++		}
+ 		if app.cron != nil {
+ 			app.cron.Stop()
+ 		}
+diff --git a/app/config_runtime.go b/app/config_runtime.go
+index e97a5d5..ac0d58f 100644
+--- a/app/config_runtime.go
++++ b/app/config_runtime.go
+@@ -10,16 +10,18 @@ import (
+ const (
+ 	configStateApplied        = "applied"
+ 	configStatePendingNextRun = "pending-next-run"
++	configStatePendingService = "pending-service-reconfigure"
+ 	configStateRestartNeeded  = "restart-required"
+ )
+ 
+ type configApplyStatus struct {
+-	State           string   `json:"state"`
+-	DesiredVersion  uint64   `json:"desired_version"`
+-	AppliedVersion  uint64   `json:"applied_version"`
+-	CheckVersion    uint64   `json:"check_version,omitempty"`
+-	Pending         bool     `json:"pending"`
+-	RestartRequired []string `json:"restart_required"`
++	State           string              `json:"state"`
++	DesiredVersion  uint64              `json:"desired_version"`
++	AppliedVersion  uint64              `json:"applied_version"`
++	CheckVersion    uint64              `json:"check_version,omitempty"`
++	Pending         bool                `json:"pending"`
++	RestartRequired []string            `json:"restart_required"`
++	SubStore        subStoreApplyStatus `json:"sub_store"`
+ }
+ 
+ func cloneConfig(src *config.Config) *config.Config {
+@@ -106,9 +108,15 @@ func (app *App) restartRequiredFieldsLocked() []string {
+ 
+ func (app *App) configStatusLocked() configApplyStatus {
+ 	restartRequired := app.restartRequiredFieldsLocked()
++	subStoreStatus := subStoreApplyStatus{State: subStoreStateDisabled}
++	if app.subStoreManager != nil {
++		subStoreStatus = app.subStoreManager.Status()
++	}
+ 	state := configStateApplied
+ 	if app.pendingConfig != nil {
+ 		state = configStatePendingNextRun
++	} else if subStoreStatus.Pending {
++		state = configStatePendingService
+ 	} else if len(restartRequired) > 0 {
+ 		state = configStateRestartNeeded
+ 	}
+@@ -119,6 +127,7 @@ func (app *App) configStatusLocked() configApplyStatus {
+ 		CheckVersion:    app.checkConfigVersion.Load(),
+ 		Pending:         app.pendingConfig != nil,
+ 		RestartRequired: restartRequired,
++		SubStore:        subStoreStatus,
+ 	}
+ }
+ 
+diff --git a/app/config_runtime_test.go b/app/config_runtime_test.go
+index af0e16b..e8e33af 100644
+--- a/app/config_runtime_test.go
++++ b/app/config_runtime_test.go
+@@ -1,11 +1,13 @@
+ package app
+ 
+ import (
++	"context"
+ 	"os"
+ 	"path/filepath"
+ 	"slices"
+ 	"sync"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/sinspired/subs-check-pro/v2/config"
+ )
+@@ -33,6 +35,11 @@ func newRuntimeConfigTestApp(t *testing.T, content string) *App {
+ 	app.interval = normalizedCheckInterval(config.GlobalConfig.CheckInterval)
+ 	app.setTimer()
+ 	t.Cleanup(func() {
++		if app.subStoreManager != nil {
++			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++			_ = app.subStoreManager.Close(ctx)
++			cancel()
++		}
+ 		if app.cron != nil {
+ 			app.cron.Stop()
+ 		}
+diff --git a/app/substore_manager.go b/app/substore_manager.go
+new file mode 100644
+index 0000000..c077b1d
+--- /dev/null
++++ b/app/substore_manager.go
+@@ -0,0 +1,310 @@
++package app
++
++import (
++	"context"
++	"log/slog"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/sinspired/subs-check-pro/v2/assets"
++	"github.com/sinspired/subs-check-pro/v2/config"
++	"github.com/sinspired/subs-check-pro/v2/utils"
++)
++
++const (
++	subStoreStateDisabled    = "disabled"
++	subStoreStateRunning     = "running"
++	subStoreStateReconciling = "reconciling"
++	subStoreStateError       = "error"
++)
++
++type subStoreApplyStatus struct {
++	State          string `json:"state"`
++	DesiredVersion uint64 `json:"desired_version"`
++	AppliedVersion uint64 `json:"applied_version"`
++	Pending        bool   `json:"pending"`
++	WaitingReason  string `json:"waiting_reason,omitempty"`
++	LastError      string `json:"last_error,omitempty"`
++	ActiveProcess  bool   `json:"active_process"`
++	DesiredPort    string `json:"desired_port,omitempty"`
++	AppliedPort    string `json:"applied_port,omitempty"`
++}
++
++type subStoreRequest struct {
++	spec    assets.SubStoreRuntimeSpec
++	version uint64
++}
++
++type subStoreRunner func(context.Context, assets.SubStoreRuntimeSpec)
++type subStoreKiller func() error
++
++// subStoreManager owns the only Sub-Store supervisor goroutine. Config reloads
++// merely replace the desired request in its one-slot mailbox and return.
++type subStoreManager struct {
++	ctx         context.Context
++	cancel      context.CancelFunc
++	requests    chan subStoreRequest
++	done        chan struct{}
++	run         subStoreRunner
++	kill        subStoreKiller
++	stopTimeout time.Duration
++
++	submitMu    sync.Mutex
++	statusMu    sync.RWMutex
++	status      subStoreApplyStatus
++	appliedSpec assets.SubStoreRuntimeSpec
++}
++
++func newSubStoreManager(run subStoreRunner, kill subStoreKiller) *subStoreManager {
++	ctx, cancel := context.WithCancel(context.Background())
++	manager := &subStoreManager{
++		ctx:         ctx,
++		cancel:      cancel,
++		requests:    make(chan subStoreRequest, 1),
++		done:        make(chan struct{}),
++		run:         run,
++		kill:        kill,
++		stopTimeout: 3 * time.Second,
++		status: subStoreApplyStatus{
++			State: subStoreStateDisabled,
++		},
++	}
++	go manager.loop()
++	return manager
++}
++
++func (manager *subStoreManager) Submit(spec assets.SubStoreRuntimeSpec, version uint64) {
++	if strings.TrimSpace(spec.Port) == "" {
++		spec = assets.SubStoreRuntimeSpec{}
++	}
++	request := subStoreRequest{spec: spec, version: version}
++
++	manager.submitMu.Lock()
++	defer manager.submitMu.Unlock()
++
++	manager.statusMu.Lock()
++	manager.status.DesiredVersion = version
++	manager.status.DesiredPort = spec.Port
++	if !manager.status.Pending && spec == manager.appliedSpec {
++		manager.status.AppliedVersion = version
++		manager.status.AppliedPort = spec.Port
++		manager.status.Pending = false
++		manager.status.WaitingReason = ""
++		manager.status.LastError = ""
++		if strings.TrimSpace(spec.Port) == "" {
++			manager.status.State = subStoreStateDisabled
++			manager.status.ActiveProcess = false
++		} else {
++			manager.status.State = subStoreStateRunning
++			manager.status.ActiveProcess = true
++		}
++		manager.statusMu.Unlock()
++		return
++	}
++	manager.status.Pending = manager.status.AppliedVersion != version
++	if manager.status.Pending {
++		manager.status.State = subStoreStateReconciling
++		manager.status.WaitingReason = "applying-latest-runtime-spec"
++	}
++	manager.statusMu.Unlock()
++
++	select {
++	case manager.requests <- request:
++	default:
++		<-manager.requests
++		manager.requests <- request
++	}
++}
++
++func (manager *subStoreManager) Status() subStoreApplyStatus {
++	manager.statusMu.RLock()
++	defer manager.statusMu.RUnlock()
++	return manager.status
++}
++
++func (manager *subStoreManager) Close(ctx context.Context) error {
++	manager.cancel()
++	select {
++	case <-manager.done:
++		return nil
++	case <-ctx.Done():
++		return ctx.Err()
++	}
++}
++
++func (manager *subStoreManager) setStatus(update func(*subStoreApplyStatus)) {
++	manager.statusMu.Lock()
++	defer manager.statusMu.Unlock()
++	update(&manager.status)
++}
++
++func (manager *subStoreManager) latestRequest(first subStoreRequest) subStoreRequest {
++	latest := first
++	for {
++		select {
++		case latest = <-manager.requests:
++		default:
++			return latest
++		}
++	}
++}
++
++func (manager *subStoreManager) stopActive(cancel context.CancelFunc, done <-chan struct{}) {
++	cancel()
++	timer := time.NewTimer(manager.stopTimeout)
++	defer timer.Stop()
++
++	select {
++	case <-done:
++		return
++	case <-timer.C:
++		manager.setStatus(func(status *subStoreApplyStatus) {
++			status.WaitingReason = "graceful-stop-timeout"
++		})
++		if err := manager.kill(); err != nil {
++			manager.setStatus(func(status *subStoreApplyStatus) {
++				status.LastError = err.Error()
++			})
++			slog.Error("Sub-Store fallback cleanup failed", "error", err)
++		}
++	}
++
++	select {
++	case <-done:
++	case <-time.After(time.Second):
++		manager.setStatus(func(status *subStoreApplyStatus) {
++			status.LastError = "sub-store runner did not exit after fallback cleanup"
++		})
++	}
++}
++
++func (manager *subStoreManager) loop() {
++	defer close(manager.done)
++
++	var activeSpec assets.SubStoreRuntimeSpec
++	var activeVersion uint64
++	var activeCancel context.CancelFunc
++	var activeDone <-chan struct{}
++
++	for {
++		select {
++		case <-manager.ctx.Done():
++			if activeCancel != nil {
++				manager.stopActive(activeCancel, activeDone)
++			}
++			manager.setStatus(func(status *subStoreApplyStatus) {
++				status.State = subStoreStateDisabled
++				status.Pending = false
++				status.ActiveProcess = false
++				status.WaitingReason = ""
++			})
++			return
++
++		case request := <-manager.requests:
++			request = manager.latestRequest(request)
++
++			if activeCancel != nil && request.spec == activeSpec {
++				activeVersion = request.version
++				manager.setStatus(func(status *subStoreApplyStatus) {
++					manager.appliedSpec = activeSpec
++					status.State = subStoreStateRunning
++					status.AppliedVersion = activeVersion
++					status.AppliedPort = activeSpec.Port
++					status.Pending = false
++					status.ActiveProcess = true
++					status.WaitingReason = ""
++					status.LastError = ""
++				})
++				continue
++			}
++
++			if activeCancel != nil {
++				manager.setStatus(func(status *subStoreApplyStatus) {
++					status.State = subStoreStateReconciling
++					status.WaitingReason = "stopping-previous-process"
++				})
++				manager.stopActive(activeCancel, activeDone)
++				activeCancel = nil
++				activeDone = nil
++			}
++
++			request = manager.latestRequest(request)
++			if strings.TrimSpace(request.spec.Port) == "" {
++				activeSpec = assets.SubStoreRuntimeSpec{}
++				activeVersion = request.version
++				manager.setStatus(func(status *subStoreApplyStatus) {
++					manager.appliedSpec = assets.SubStoreRuntimeSpec{}
++					status.State = subStoreStateDisabled
++					status.AppliedVersion = request.version
++					status.AppliedPort = ""
++					status.Pending = false
++					status.ActiveProcess = false
++					status.WaitingReason = ""
++					status.LastError = ""
++				})
++				continue
++			}
++
++			runCtx, cancel := context.WithCancel(manager.ctx)
++			done := make(chan struct{})
++			activeSpec = request.spec
++			activeVersion = request.version
++			activeCancel = cancel
++			activeDone = done
++			manager.setStatus(func(status *subStoreApplyStatus) {
++				manager.appliedSpec = request.spec
++				status.State = subStoreStateRunning
++				status.AppliedVersion = request.version
++				status.AppliedPort = request.spec.Port
++				status.Pending = false
++				status.ActiveProcess = true
++				status.WaitingReason = ""
++				status.LastError = ""
++			})
++			go func(spec assets.SubStoreRuntimeSpec) {
++				defer close(done)
++				manager.run(runCtx, spec)
++			}(request.spec)
++
++		case <-activeDone:
++			activeCancel = nil
++			activeDone = nil
++			manager.setStatus(func(status *subStoreApplyStatus) {
++				status.State = subStoreStateError
++				status.ActiveProcess = false
++				status.LastError = "sub-store supervisor exited unexpectedly"
++			})
++		}
++	}
++}
++
++func (app *App) normalizeSubStorePathLocked(candidate string) string {
++	path := strings.TrimSpace(candidate)
++	if path == "" && app.appliedConfig != nil {
++		path = strings.TrimSpace(app.appliedConfig.SubStorePath)
++	}
++	if path == "" {
++		if app.subStoreGeneratedPath == "" {
++			app.subStoreGeneratedPath = "/" + utils.GenerateRandomString(20)
++		}
++		path = app.subStoreGeneratedPath
++	}
++	if !strings.HasPrefix(path, "/") {
++		path = "/" + path
++	}
++	return path
++}
++
++func (app *App) subStoreSpecLocked(runtimeConfig *config.Config) assets.SubStoreRuntimeSpec {
++	runtimeConfig.SubStorePath = app.normalizeSubStorePathLocked(runtimeConfig.SubStorePath)
++	return assets.SubStoreRuntimeSpec{
++		ListenPort:         runtimeConfig.ListenPort,
++		Port:               runtimeConfig.SubStorePort,
++		Path:               runtimeConfig.SubStorePath,
++		SyncCron:           runtimeConfig.SubStoreSyncCron,
++		ProduceCron:        runtimeConfig.SubStoreProduceCron,
++		PushService:        runtimeConfig.SubStorePushService,
++		MihomoOverwriteURL: runtimeConfig.MihomoOverwriteURL,
++	}
++}
+diff --git a/app/substore_manager_test.go b/app/substore_manager_test.go
+new file mode 100644
+index 0000000..0422b78
+--- /dev/null
++++ b/app/substore_manager_test.go
+@@ -0,0 +1,160 @@
++package app
++
++import (
++	"context"
++	"fmt"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/sinspired/subs-check-pro/v2/assets"
++)
++
++func waitForSubStoreStatus(t *testing.T, manager *subStoreManager, predicate func(subStoreApplyStatus) bool) subStoreApplyStatus {
++	t.Helper()
++	deadline := time.Now().Add(2 * time.Second)
++	for time.Now().Before(deadline) {
++		status := manager.Status()
++		if predicate(status) {
++			return status
++		}
++		time.Sleep(5 * time.Millisecond)
++	}
++	t.Fatalf("Sub-Store status did not converge: %#v", manager.Status())
++	return subStoreApplyStatus{}
++}
++
++func closeSubStoreManager(t *testing.T, manager *subStoreManager) {
++	t.Helper()
++	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++	defer cancel()
++	if err := manager.Close(ctx); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestSubStoreSubmitReturnsWithoutWaitingForProcessExit(t *testing.T) {
++	started := make(chan struct{}, 2)
++	manager := newSubStoreManager(func(ctx context.Context, _ assets.SubStoreRuntimeSpec) {
++		started <- struct{}{}
++		<-ctx.Done()
++	}, func() error { return nil })
++	defer closeSubStoreManager(t, manager)
++
++	manager.Submit(assets.SubStoreRuntimeSpec{Port: ":8299", Path: "/one"}, 1)
++	<-started
++
++	start := time.Now()
++	manager.Submit(assets.SubStoreRuntimeSpec{Port: ":8399", Path: "/two"}, 2)
++	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
++		t.Fatalf("Submit blocked for %s", elapsed)
++	}
++	waitForSubStoreStatus(t, manager, func(status subStoreApplyStatus) bool {
++		return status.AppliedVersion == 2 && !status.Pending
++	})
++}
++
++func TestSubStoreManagerCoalescesRapidChangesAndNeverOverlapsRunners(t *testing.T) {
++	var active atomic.Int32
++	var maxActive atomic.Int32
++	var mu sync.Mutex
++	var starts []assets.SubStoreRuntimeSpec
++
++	manager := newSubStoreManager(func(ctx context.Context, spec assets.SubStoreRuntimeSpec) {
++		now := active.Add(1)
++		for {
++			previous := maxActive.Load()
++			if now <= previous || maxActive.CompareAndSwap(previous, now) {
++				break
++			}
++		}
++		mu.Lock()
++		starts = append(starts, spec)
++		mu.Unlock()
++		<-ctx.Done()
++		active.Add(-1)
++	}, func() error { return nil })
++	defer closeSubStoreManager(t, manager)
++
++	for version := uint64(1); version <= 10; version++ {
++		manager.Submit(assets.SubStoreRuntimeSpec{
++			Port:        fmt.Sprintf(":%d", 8299+version),
++			Path:        "/latest",
++			SyncCron:    "1 * * * *",
++			ProduceCron: "2 * * * *",
++			PushService: "https://example.invalid/push",
++		}, version)
++	}
++
++	status := waitForSubStoreStatus(t, manager, func(status subStoreApplyStatus) bool {
++		return status.AppliedVersion == 10 && !status.Pending
++	})
++	if maxActive.Load() != 1 {
++		t.Fatalf("maximum concurrent runners = %d, want 1", maxActive.Load())
++	}
++	mu.Lock()
++	last := starts[len(starts)-1]
++	mu.Unlock()
++	if status.AppliedPort != last.Port {
++		t.Fatalf("applied port = %q, last runner port = %q", status.AppliedPort, last.Port)
++	}
++}
++
++func TestSubStoreRuntimeSpecChangesTriggerReconcile(t *testing.T) {
++	started := make(chan assets.SubStoreRuntimeSpec, 8)
++	manager := newSubStoreManager(func(ctx context.Context, spec assets.SubStoreRuntimeSpec) {
++		started <- spec
++		<-ctx.Done()
++	}, func() error { return nil })
++	defer closeSubStoreManager(t, manager)
++
++	specs := []assets.SubStoreRuntimeSpec{
++		{Port: ":8299", Path: "/one"},
++		{Port: ":8399", Path: "/one"},
++		{Port: ":8399", Path: "/two"},
++		{Port: ":8399", Path: "/two", SyncCron: "1 * * * *"},
++		{Port: ":8399", Path: "/two", SyncCron: "1 * * * *", ProduceCron: "2 * * * *"},
++		{Port: ":8399", Path: "/two", SyncCron: "1 * * * *", ProduceCron: "2 * * * *", PushService: "push"},
++		{Port: ":8399", Path: "/two", SyncCron: "1 * * * *", ProduceCron: "2 * * * *", PushService: "push", MihomoOverwriteURL: "http://127.0.0.1:9090"},
++	}
++	for index, spec := range specs {
++		version := uint64(index + 1)
++		manager.Submit(spec, version)
++		select {
++		case got := <-started:
++			if got != spec {
++				t.Fatalf("runner spec = %#v, want %#v", got, spec)
++			}
++		case <-time.After(time.Second):
++			t.Fatalf("spec version %d was not started", version)
++		}
++	}
++}
++
++func TestSubStoreManagerUsesKillFallbackAfterStopTimeout(t *testing.T) {
++	release := make(chan struct{})
++	var killCalls atomic.Int32
++	manager := newSubStoreManager(func(_ context.Context, _ assets.SubStoreRuntimeSpec) {
++		<-release
++	}, func() error {
++		if killCalls.Add(1) == 1 {
++			close(release)
++		}
++		return nil
++	})
++	manager.stopTimeout = 20 * time.Millisecond
++	defer closeSubStoreManager(t, manager)
++
++	manager.Submit(assets.SubStoreRuntimeSpec{Port: ":8299"}, 1)
++	waitForSubStoreStatus(t, manager, func(status subStoreApplyStatus) bool {
++		return status.AppliedVersion == 1
++	})
++	manager.Submit(assets.SubStoreRuntimeSpec{}, 2)
++	waitForSubStoreStatus(t, manager, func(status subStoreApplyStatus) bool {
++		return status.AppliedVersion == 2 && status.State == subStoreStateDisabled
++	})
++	if killCalls.Load() != 1 {
++		t.Fatalf("kill fallback calls = %d, want 1", killCalls.Load())
++	}
++}
+diff --git a/assets/sub_run.go b/assets/sub_run.go
+index ab15e20..8c5c2a2 100644
+--- a/assets/sub_run.go
++++ b/assets/sub_run.go
+@@ -20,7 +20,6 @@ import (
+ 
+ 	"github.com/klauspost/compress/zstd"
+ 	"github.com/shirou/gopsutil/v4/process"
+-	"github.com/sinspired/subs-check-pro/v2/config"
+ 	"github.com/sinspired/subs-check-pro/v2/save/method"
+ 	"github.com/sinspired/subs-check-pro/v2/utils"
+ 	"gopkg.in/natefinch/lumberjack.v2"
+@@ -29,6 +28,19 @@ import (
+ var InitSubStorePath = ""
+ var IsSubStoreRunning atomic.Bool
+ 
++// SubStoreRuntimeSpec is an immutable description of one Sub-Store process.
++// A child process must not read GlobalConfig while it is starting because a
++// concurrent reload could otherwise mix fields from different versions.
++type SubStoreRuntimeSpec struct {
++	ListenPort         string
++	Port               string
++	Path               string
++	SyncCron           string
++	ProduceCron        string
++	PushService        string
++	MihomoOverwriteURL string
++}
++
+ type subStorePaths struct {
+ 	substoreDir                       string
+ 	nodePath                          string
+@@ -79,9 +91,9 @@ func logStop(port string) {
+ }
+ 
+ // RunSubStoreService 运行sub-store服务，支持 ctx，可被外部取消
+-func RunSubStoreService(ctx context.Context) {
+-	listenPort := strings.TrimPrefix(config.GlobalConfig.ListenPort, ":")
+-	subStorePort := strings.TrimPrefix(config.GlobalConfig.SubStorePort, ":")
++func RunSubStoreService(ctx context.Context, spec SubStoreRuntimeSpec) {
++	listenPort := strings.TrimPrefix(spec.ListenPort, ":")
++	subStorePort := strings.TrimPrefix(spec.Port, ":")
+ 
+ 	if subStorePort == "" {
+ 		IsSubStoreRunning.Store(false)
+@@ -103,19 +115,17 @@ func RunSubStoreService(ctx context.Context) {
+ 	for {
+ 		select {
+ 		case <-ctx.Done():
+-			subStorePort := strings.TrimPrefix(config.GlobalConfig.SubStorePort, ":")
+ 			logStop(subStorePort)
+ 			IsSubStoreRunning.Store(false)
+ 			return
+ 		default:
+-			if err := startSubStore(ctx); err != nil {
++			if err := startSubStore(ctx, spec); err != nil {
+ 				slog.Error("Sub-store 服务崩溃, 正在重启...", "error", err)
+ 				IsSubStoreRunning.Store(false)
+ 			}
+ 			// 在循环间隙检查 ctx，若被取消则退出
+ 			select {
+ 			case <-ctx.Done():
+-				subStorePort := strings.TrimPrefix(config.GlobalConfig.SubStorePort, ":")
+ 				logStop(subStorePort)
+ 				IsSubStoreRunning.Store(false)
+ 				return
+@@ -168,7 +178,7 @@ func killNodeProcess(nodePath string) {
+ 	}
+ }
+ 
+-func startSubStore(ctx context.Context) error {
++func startSubStore(ctx context.Context, spec SubStoreRuntimeSpec) error {
+ 	paths, err := getSubStorePaths()
+ 	if err != nil {
+ 		return err
+@@ -231,17 +241,17 @@ func startSubStore(ctx context.Context) error {
+ 
+ 	// 检查MihomoOverwriteUrl是否包含本地IP，如果是则移除代理环境变量
+ 	cleanProxyEnv := false
+-	if config.GlobalConfig.MihomoOverwriteURL != "" {
+-		if _, err := url.Parse(config.GlobalConfig.MihomoOverwriteURL); err == nil {
+-			if utils.IsLocalURL(config.GlobalConfig.MihomoOverwriteURL) {
++	if spec.MihomoOverwriteURL != "" {
++		if _, err := url.Parse(spec.MihomoOverwriteURL); err == nil {
++			if utils.IsLocalURL(spec.MihomoOverwriteURL) {
+ 				cleanProxyEnv = true
+-				slog.Debug("MihomoOverwriteUrl 是本地地址，移除代理环境变量", "url", config.GlobalConfig.MihomoOverwriteURL)
++				slog.Debug("MihomoOverwriteUrl 是本地地址，移除代理环境变量", "url", spec.MihomoOverwriteURL)
+ 			}
+ 		}
+ 	}
+ 
+ 	// ipv4/ipv6 都支持
+-	subStoreHost := config.GlobalConfig.SubStorePort
++	subStoreHost := spec.Port
+ 	if strings.Contains(subStoreHost, ":") {
+ 		hostPort := strings.Split(subStoreHost, ":")
+ 
+@@ -294,23 +304,24 @@ func startSubStore(ctx context.Context) error {
+ 	// 增加body限制，默认1M
+ 	cmd.Env = append(cmd.Env, "SUB_STORE_BODY_JSON_LIMIT=30mb")
+ 
+-	InitSubStorePath = strings.TrimSpace(config.GlobalConfig.SubStorePath)
++	subStorePath := strings.TrimSpace(spec.Path)
++	InitSubStorePath = subStorePath
+ 	// 增加自定义访问路径
+-	if strings.TrimSpace(config.GlobalConfig.SubStorePath) != "" {
++	if subStorePath != "" {
+ 		// 如果不是以 "/" 开头，则补上
+-		if !strings.HasPrefix(config.GlobalConfig.SubStorePath, "/") {
+-			config.GlobalConfig.SubStorePath = "/" + config.GlobalConfig.SubStorePath
++		if !strings.HasPrefix(subStorePath, "/") {
++			subStorePath = "/" + subStorePath
+ 		}
+ 	} else {
+ 		// 生成一个随机的 SubStorePath
+-		config.GlobalConfig.SubStorePath = "/" + utils.GenerateRandomString(20)
+-		slog.Info("已随机生成", "sub-store-path", config.GlobalConfig.SubStorePath)
++		subStorePath = "/" + utils.GenerateRandomString(20)
++		slog.Info("已随机生成", "sub-store-path", subStorePath)
+ 	}
+ 
+ 	// TODO: 集成http-meta服务
+ 	// 设置后端path
+ 	cmd.Env = append(cmd.Env,
+-		"SUB_STORE_FRONTEND_BACKEND_PATH="+config.GlobalConfig.SubStorePath,
++		"SUB_STORE_FRONTEND_BACKEND_PATH="+subStorePath,
+ 	)
+ 
+ 	// 集成sub-store前端并启用合并功能
+@@ -320,18 +331,18 @@ func startSubStore(ctx context.Context) error {
+ 	)
+ 
+ 	// sub-store 环境变量: 后端上传文件至 gist
+-	if config.GlobalConfig.SubStoreSyncCron != "" {
+-		cmd.Env = append(cmd.Env, "SUB_STORE_BACKEND_SYNC_CRON="+config.GlobalConfig.SubStoreSyncCron)
++	if spec.SyncCron != "" {
++		cmd.Env = append(cmd.Env, "SUB_STORE_BACKEND_SYNC_CRON="+spec.SyncCron)
+ 	}
+ 
+ 	// sub-store 环境变量: 自动拉取订阅内容
+-	if config.GlobalConfig.SubStoreProduceCron != "" {
+-		cmd.Env = append(cmd.Env, "SUB_STORE_PRODUCE_CRON="+config.GlobalConfig.SubStoreProduceCron)
++	if spec.ProduceCron != "" {
++		cmd.Env = append(cmd.Env, "SUB_STORE_PRODUCE_CRON="+spec.ProduceCron)
+ 	}
+ 
+ 	// sub-store 环境变量: 当遇到错误时发送通知
+-	if config.GlobalConfig.SubStorePushService != "" {
+-		cmd.Env = append(cmd.Env, "SUB_STORE_PUSH_SERVICE="+config.GlobalConfig.SubStorePushService)
++	if spec.PushService != "" {
++		cmd.Env = append(cmd.Env, "SUB_STORE_PUSH_SERVICE="+spec.PushService)
+ 	}
+ 
+ 	// 启动子进程并监听 ctx 取消以便优雅杀掉子进程
+@@ -346,7 +357,7 @@ func startSubStore(ctx context.Context) error {
+ 		return fmt.Errorf("启动 sub-store 失败: %w", err)
+ 	}
+ 
+-	subStorePort := strings.TrimPrefix(config.GlobalConfig.SubStorePort, ":")
++	subStorePort := strings.TrimPrefix(spec.Port, ":")
+ 	slog.Info("Sub-Store已启动", "port", subStorePort, "pid", cmd.Process.Pid, "log", paths.logPath)
+ 	IsSubStoreRunning.Store(true)
+ 

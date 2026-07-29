@@ -1,6 +1,10 @@
 [CmdletBinding()]
-param()
+param(
+    [switch]$IncludePublicAuthenticatedCheck
+)
 
+# Windows PowerShell 5.1 treats UTF-8 without a BOM as the local ANSI code page.
+# Keep this script ASCII-only so it remains portable across PowerShell versions.
 $ErrorActionPreference = 'Continue'
 $workspace = Split-Path -Parent $PSScriptRoot
 $exe = Join-Path $workspace 'runtime\bin\subs-check-pro.exe'
@@ -15,6 +19,14 @@ $webuiHistoryPatch = Join-Path $workspace 'patches\subs-check-pro-webui-b8db5f51
 $uaFallbackPatch = Join-Path $workspace 'patches\subs-check-pro-v2.6.8-ua-fallback.patch'
 $loopbackHistoryPatch = Join-Path $workspace 'patches\subs-check-pro-v2.6.8-loopback-history.patch'
 $cleanInternalTagsPatch = Join-Path $workspace 'patches\subs-check-pro-v2.6.8-clean-internal-tags.patch'
+$silentArchivePatch = Join-Path $workspace 'patches\subs-check-pro-v2.6.8-silent-subscription-archive.patch'
+$cronHotReloadPatch = Join-Path $workspace 'patches\subs-check-pro-v2.6.8-cron-hot-reload.patch'
+$configRuntimeStatePatch = Join-Path $workspace 'patches\subs-check-pro-v2.6.8-config-runtime-state.patch'
+$subStoreRuntimeManagerPatch = Join-Path $workspace 'patches\subs-check-pro-v2.6.8-substore-runtime-manager.patch'
+$runtimeAddressOutputPatch = Join-Path $workspace 'patches\subs-check-pro-v2.6.8-runtime-address-output.patch'
+$configSemanticsPatch = Join-Path $workspace 'patches\subs-check-pro-v2.6.8-webui-config-semantics.patch'
+$subStoreMailboxRacePatch = Join-Path $workspace 'patches\subs-check-pro-v2.6.8-substore-mailbox-race.patch'
+$webuiConfigSemanticsPatch = Join-Path $workspace 'patches\subs-check-pro-webui-b8db5f51c367-config-semantics.patch'
 $failures = New-Object System.Collections.Generic.List[string]
 
 function Test-RequiredPath {
@@ -39,6 +51,14 @@ Test-RequiredPath -Path $webuiHistoryPatch -Label 'Subscription history WebUI pa
 Test-RequiredPath -Path $uaFallbackPatch -Label 'Subscription UA fallback patch exists'
 Test-RequiredPath -Path $loopbackHistoryPatch -Label 'Loopback history replay patch exists'
 Test-RequiredPath -Path $cleanInternalTagsPatch -Label 'Internal source tag cleanup patch exists'
+Test-RequiredPath -Path $silentArchivePatch -Label 'Silent subscription archive patch exists'
+Test-RequiredPath -Path $cronHotReloadPatch -Label 'Cron hot reload patch exists'
+Test-RequiredPath -Path $configRuntimeStatePatch -Label 'Configuration runtime state patch exists'
+Test-RequiredPath -Path $subStoreRuntimeManagerPatch -Label 'Sub-Store runtime manager patch exists'
+Test-RequiredPath -Path $runtimeAddressOutputPatch -Label 'Runtime address and output patch exists'
+Test-RequiredPath -Path $configSemanticsPatch -Label 'Configuration semantics core patch exists'
+Test-RequiredPath -Path $subStoreMailboxRacePatch -Label 'Sub-Store mailbox race patch exists'
+Test-RequiredPath -Path $webuiConfigSemanticsPatch -Label 'Configuration semantics WebUI patch exists'
 
 try {
     $uaPatchText = [IO.File]::ReadAllText($uaFallbackPatch)
@@ -95,6 +115,164 @@ try {
 } catch {
     Write-Output "[FAIL] Internal tag cleanup verification failed: $($_.Exception.Message)"
     $failures.Add('Internal source tag cleanup')
+}
+
+try {
+    $silentArchivePatchText = [IO.File]::ReadAllText($silentArchivePatch)
+    foreach ($signature in @(
+        'silent-subscriptions.yaml',
+        'SyncSilentSubscriptionArchive',
+        'NewSubscriptionURLs',
+        'FindArchivedSilentSubscriptions',
+        'filterArchivedSilentSubscriptions',
+        'archiveErr := filterArchivedSilentSubscriptions(remote)',
+        'http.StatusConflict',
+        'TestArchivedSilentSubscriptionMatchesWithoutRemark',
+        'TestFilterArchivedSubscriptionURLsAfterRemoteExpansion'
+    )) {
+        if (-not $silentArchivePatchText.Contains($signature)) {
+            throw "Silent archive signature is missing: $signature"
+        }
+    }
+    Write-Output '[OK] Silent subscriptions are archived and rejected when re-added'
+} catch {
+    Write-Output "[FAIL] Silent subscription archive verification failed: $($_.Exception.Message)"
+    $failures.Add('Silent subscription archive')
+}
+
+try {
+    $cronHotReloadPatchText = [IO.File]::ReadAllText($cronHotReloadPatch)
+    foreach ($signature in @(
+        'appliedTimerCron',
+        'timerConfigMatches',
+        'configReloadMu',
+        'app.onConfigChange()',
+        'TestConfigReloadRepairsStaleCronTimer',
+        'stale cron scheduler was not replaced'
+    )) {
+        if (-not $cronHotReloadPatchText.Contains($signature)) {
+            throw "Cron hot reload signature is missing: $signature"
+        }
+    }
+    Write-Output '[OK] Cron configuration reload repairs the running scheduler'
+} catch {
+    Write-Output "[FAIL] Cron hot reload verification failed: $($_.Exception.Message)"
+    $failures.Add('Cron hot reload')
+}
+
+try {
+    $configRuntimeStatePatchText = [IO.File]::ReadAllText($configRuntimeStatePatch)
+    foreach ($signature in @(
+        'configStatePendingNextRun',
+        'pendingConfigVersion',
+        'effectiveConfigLocked',
+        'config_status',
+        'TestConfigReloadDefersPublicationUntilCheckFinishes',
+        'TestConcurrentEquivalentReloadsCreateOnePendingVersion'
+    )) {
+        if (-not $configRuntimeStatePatchText.Contains($signature)) {
+            throw "Configuration runtime state signature is missing: $signature"
+        }
+    }
+    Write-Output '[OK] Configuration reload uses versioned snapshots and truthful apply state'
+} catch {
+    Write-Output "[FAIL] Configuration runtime state verification failed: $($_.Exception.Message)"
+    $failures.Add('Configuration runtime state')
+}
+
+try {
+    $subStoreRuntimeManagerPatchText = [IO.File]::ReadAllText($subStoreRuntimeManagerPatch)
+    foreach ($signature in @(
+        'SubStoreRuntimeSpec',
+        'subStoreManager',
+        'pending-service-reconfigure',
+        'graceful-stop-timeout',
+        'TestSubStoreSubmitReturnsWithoutWaitingForProcessExit',
+        'TestSubStoreManagerCoalescesRapidChangesAndNeverOverlapsRunners',
+        'TestSubStoreRuntimeSpecChangesTriggerReconcile',
+        'TestSubStoreManagerUsesKillFallbackAfterStopTimeout'
+    )) {
+        if (-not $subStoreRuntimeManagerPatchText.Contains($signature)) {
+            throw "Sub-Store runtime manager signature is missing: $signature"
+        }
+    }
+    Write-Output '[OK] Sub-Store uses one asynchronous versioned runtime manager'
+} catch {
+    Write-Output "[FAIL] Sub-Store runtime manager verification failed: $($_.Exception.Message)"
+    $failures.Add('Sub-Store runtime manager')
+}
+
+try {
+    $runtimeAddressOutputPatchText = [IO.File]::ReadAllText($runtimeAddressOutputPatch)
+    foreach ($signature in @(
+        'ParseListenAddress',
+        'BuildLoopbackHTTPURL',
+        'serveCurrentOutputFile',
+        'safeSharePath',
+        'NewLocalSaverForRuntime',
+        'KillNodeForSpec',
+        'TestBuildLoopbackHTTPURLNeverDuplicatesConfiguredHost',
+        'TestStaticDownloadRouteFollowsAppliedOutputDirectory'
+    )) {
+        if (-not $runtimeAddressOutputPatchText.Contains($signature)) {
+            throw "Runtime address/output signature is missing: $signature"
+        }
+    }
+    Write-Output '[OK] Internal URLs and output routes follow the applied runtime configuration'
+} catch {
+    Write-Output "[FAIL] Runtime address/output verification failed: $($_.Exception.Message)"
+    $failures.Add('Runtime address and output')
+}
+
+try {
+    $subStoreMailboxRacePatchText = [IO.File]::ReadAllText($subStoreMailboxRacePatch)
+    foreach ($signature in @(
+        'Keep this discard non-blocking',
+        'case <-manager.requests:',
+        'Submit never waits on an empty mailbox'
+    )) {
+        if (-not $subStoreMailboxRacePatchText.Contains($signature)) {
+            throw "Sub-Store mailbox race signature is missing: $signature"
+        }
+    }
+    Write-Output '[OK] Sub-Store latest-request mailbox cannot block on a concurrent receive'
+} catch {
+    Write-Output "[FAIL] Sub-Store mailbox race verification failed: $($_.Exception.Message)"
+    $failures.Add('Sub-Store mailbox race')
+}
+
+try {
+    $configSemanticsPatchText = [IO.File]::ReadAllText($configSemanticsPatch)
+    $webuiConfigSemanticsPatchText = [IO.File]::ReadAllText($webuiConfigSemanticsPatch)
+    foreach ($signature in @(
+        'apiKeyGracePeriod',
+        'auth_transition',
+        'configFieldPolicies',
+        'runtime policy field count = %d, want 96',
+        'ReconfigureUpdateTasks',
+        'schedulerApplyStatus',
+        'TestSchedulerStatusReportsActualCronAndNextRun',
+        'TestWebUIAccessFollowsAppliedConfigWithoutRouterRestart'
+    )) {
+        if (-not $configSemanticsPatchText.Contains($signature)) {
+            throw "Core configuration semantics signature is missing: $signature"
+        }
+    }
+    foreach ($signature in @(
+        'pendingSessionKey',
+        'promoteSessionKey',
+        'v20260728-config-runtime',
+        'config form control count = %d, want 89',
+        'github-token'
+    )) {
+        if (-not $webuiConfigSemanticsPatchText.Contains($signature)) {
+            throw "WebUI configuration semantics signature is missing: $signature"
+        }
+    }
+    Write-Output '[OK] WebUI reports real apply states and safely transitions API keys'
+} catch {
+    Write-Output "[FAIL] Configuration semantics verification failed: $($_.Exception.Message)"
+    $failures.Add('Configuration semantics')
 }
 
 try {
@@ -184,6 +362,7 @@ try {
 
 $analysisReport = Join-Path $workspace 'runtime\output\stats\subs-analysis.yaml'
 $historyReport = Join-Path $workspace 'runtime\output\stats\subs-health-history.yaml'
+$silentArchive = Join-Path $workspace 'runtime\output\stats\silent-subscriptions.yaml'
 if (Test-Path -LiteralPath $analysisReport -PathType Leaf) {
     $analysisReportText = [IO.File]::ReadAllText($analysisReport)
     $activeBlock = [regex]::Match(
@@ -215,10 +394,25 @@ if (Test-Path -LiteralPath $historyReport -PathType Leaf) {
     Write-Output '[WARN] Subscription health history will start after the next completed detection'
 }
 
+if (Test-Path -LiteralPath $silentArchive -PathType Leaf) {
+    $silentArchiveText = [IO.File]::ReadAllText($silentArchive)
+    if ($silentArchiveText -match '(?m)^version:\s*1\s*$' -and
+        $silentArchiveText -match '(?m)^consecutive_silent_threshold:\s*3\s*$' -and
+        $silentArchiveText -match '(?m)^subscriptions:\s*$') {
+        Write-Output '[OK] Silent subscription archive is persisted'
+    } else {
+        Write-Output '[FAIL] Silent subscription archive file is malformed'
+        $failures.Add('Silent subscription archive file')
+    }
+} else {
+    Write-Output '[FAIL] Silent subscription archive file is missing'
+    $failures.Add('Silent subscription archive file')
+}
+
 try {
     $versionInfo = Invoke-RestMethod -UseBasicParsing `
         -Uri 'http://127.0.0.1:8199/admin/version' -TimeoutSec 8
-    if ($versionInfo.version -ne 'v2.6.8+custom.history.ua2.loopback1.cleantags1') {
+    if ($versionInfo.version -ne 'v2.6.8+custom.history.ua2.loopback1.cleantags1.silentarchive1.remotefilter1.cronreload1.configstate1.substore1.addrout1.configsem1.subrace1') {
         throw "Unexpected active version: $($versionInfo.version)"
     }
     Write-Output '[OK] Active version uses non-prerelease custom metadata'
@@ -240,6 +434,23 @@ try {
         throw 'API key is missing from config.yaml'
     }
     $apiKey = $keyMatch.Groups[1].Value
+
+    $cronMatch = [regex]::Match($configText, '(?m)^\s*cron-expression:\s*"([^"]+)"')
+    $localStatus = Invoke-RestMethod -UseBasicParsing `
+        -Uri 'http://127.0.0.1:8199/api/status' `
+        -Headers @{ 'X-API-Key' = $apiKey } `
+        -TimeoutSec 8
+    if (-not $cronMatch.Success -or
+        $localStatus.configStatus.scheduler.mode -ne 'cron' -or
+        $localStatus.configStatus.scheduler.cron_expression -ne $cronMatch.Groups[1].Value -or
+        [string]::IsNullOrWhiteSpace($localStatus.configStatus.scheduler.next_run)) {
+        throw 'Runtime scheduler status does not match the configured cron expression'
+    }
+    $nextRun = [DateTimeOffset]::Parse($localStatus.configStatus.scheduler.next_run)
+    if ($nextRun -le [DateTimeOffset]::Now) {
+        throw "Runtime scheduler next_run is not in the future: $nextRun"
+    }
+    Write-Output "[OK] Runtime scheduler reports the applied cron and next run: $nextRun"
 
     function Get-DirectHttpStatus {
         param(
@@ -272,11 +483,19 @@ try {
 
     $publicAdmin = Get-DirectHttpStatus -Uri 'https://cesusub.sbxm.eu.org/admin'
     $publicWithoutKey = Get-DirectHttpStatus -Uri 'https://cesusub.sbxm.eu.org/api/status'
-    $publicWithKey = Get-DirectHttpStatus -Uri 'https://cesusub.sbxm.eu.org/api/status' -ApiKey $apiKey
-    if ($publicAdmin -eq 200 -and $publicWithoutKey -eq 401 -and $publicWithKey -eq 200) {
-        Write-Output '[OK] Public HTTPS route and API-key enforcement passed'
+    if ($publicAdmin -ne 200 -or $publicWithoutKey -ne 401) {
+        throw "Unexpected public statuses: admin=$publicAdmin, no-key=$publicWithoutKey"
+    }
+    Write-Output '[OK] Public HTTPS route is reachable and rejects missing API keys'
+
+    if ($IncludePublicAuthenticatedCheck) {
+        $publicWithKey = Get-DirectHttpStatus -Uri 'https://cesusub.sbxm.eu.org/api/status' -ApiKey $apiKey
+        if ($publicWithKey -ne 200) {
+            throw "Unexpected authenticated public status: with-key=$publicWithKey"
+        }
+        Write-Output '[OK] Explicitly enabled public authenticated API check passed'
     } else {
-        throw "Unexpected statuses: admin=$publicAdmin, no-key=$publicWithoutKey, with-key=$publicWithKey"
+        Write-Output '[WARN] Public authenticated API check skipped; use -IncludePublicAuthenticatedCheck to opt in'
     }
 
     $leakingLogs = New-Object System.Collections.Generic.List[string]

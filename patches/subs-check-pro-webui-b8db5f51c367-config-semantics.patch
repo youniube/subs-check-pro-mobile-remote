@@ -1,0 +1,213 @@
+diff --git a/webui/config_schema_test.go b/webui/config_schema_test.go
+new file mode 100644
+index 0000000..f576822
+--- /dev/null
++++ b/webui/config_schema_test.go
+@@ -0,0 +1,25 @@
++package webui
++
++import (
++	"regexp"
++	"testing"
++)
++
++func TestConfigFormHasOneControlPerField(t *testing.T) {
++	source, err := StaticFS.ReadFile("static/js/config-form.js")
++	if err != nil {
++		t.Fatal(err)
++	}
++	matches := regexp.MustCompile(`key:\s*'([^']+)'`).FindAllSubmatch(source, -1)
++	if len(matches) != 89 {
++		t.Fatalf("config form control count = %d, want 89", len(matches))
++	}
++	seen := make(map[string]struct{}, len(matches))
++	for _, match := range matches {
++		key := string(match[1])
++		if _, exists := seen[key]; exists {
++			t.Fatalf("config form field %q has multiple controls", key)
++		}
++		seen[key] = struct{}{}
++	}
++}
+diff --git a/webui/static/js/admin.js b/webui/static/js/admin.js
+index c59ac03..7c8b127 100644
+--- a/webui/static/js/admin.js
++++ b/webui/static/js/admin.js
+@@ -1,5 +1,5 @@
+ // admin.js
+-import { initConfigForm, renderConfigForm, collectConfigForm } from './config-form.js';
++import { initConfigForm, renderConfigForm, collectConfigForm } from './config-form.js?v20260728-config-runtime';
+ import { initQuickPreview } from './cfg-quickpreview.js';
+ 
+ ; (function () {
+@@ -140,6 +140,8 @@ import { initQuickPreview } from './cfg-quickpreview.js';
+ 
+   // ==================== 全局状态 ====================
+   let sessionKey = null
++  let pendingSessionKey = null
++  let pendingSessionKeyVersion = 0
+   let timers = { logs: null, status: null }
+ 
+   // 动态间隔控制
+@@ -273,6 +275,48 @@ import { initQuickPreview } from './cfg-quickpreview.js';
+     }
+   }
+ 
++  function clearPendingSessionKey() {
++    pendingSessionKey = null
++    pendingSessionKeyVersion = 0
++    try {
++      sessionStorage.removeItem('subscheck_pending_api_key')
++      sessionStorage.removeItem('subscheck_pending_api_key_version')
++    } catch { }
++  }
++
++  function stagePendingSessionKey(key, version) {
++    if (!key || key === sessionKey) return
++    pendingSessionKey = key
++    pendingSessionKeyVersion = Number(version) || 0
++    try {
++      sessionStorage.setItem('subscheck_pending_api_key', key)
++      sessionStorage.setItem('subscheck_pending_api_key_version', String(pendingSessionKeyVersion))
++    } catch { }
++  }
++
++  function promoteSessionKey(key) {
++    if (!key) return
++    const remembered = safeLS('subscheck_api_key') !== null
++    sessionKey = key
++    if (remembered) safeLS('subscheck_api_key', key)
++    try {
++      if (sessionStorage.getItem('subscheck_session_key') !== null) {
++        sessionStorage.setItem('subscheck_session_key', key)
++      }
++    } catch { }
++    clearPendingSessionKey()
++  }
++
++  function maybePromotePendingSessionKey(payload) {
++    if (!pendingSessionKey) return
++    const status = payload?.configStatus || payload?.config_status
++    const appliedVersion = Number(status?.applied_version || 0)
++    if (pendingSessionKeyVersion === 0 || appliedVersion >= pendingSessionKeyVersion) {
++      promoteSessionKey(pendingSessionKey)
++      showToast('新 API Key 已生效，会话已安全切换', 'success')
++    }
++  }
++
+   /**
+    * 显示 Toast 消息
+    * @param {string} msg 提示文本
+@@ -607,9 +651,16 @@ import { initQuickPreview } from './cfg-quickpreview.js';
+    */
+   async function sfetch(url, opts = {}) {
+     if (!sessionKey) return { ok: false, status: 401, error: '未认证' }
+-    opts.headers = { ...opts.headers, 'X-API-Key': sessionKey }
+     try {
+-      const r = await fetch(url, opts)
++      const requestWithKey = key => fetch(url, {
++        ...opts,
++        headers: { ...opts.headers, 'X-API-Key': key }
++      })
++      let r = await requestWithKey(sessionKey)
++      if (r.status === 401 && pendingSessionKey && pendingSessionKey !== sessionKey) {
++        r = await requestWithKey(pendingSessionKey)
++        if (r.status !== 401) promoteSessionKey(pendingSessionKey)
++      }
+       const ct = r.headers.get('content-type') || ''
+       const text = await r.text()
+       let payload = ct.includes('application/json') ? JSON.parse(text) : text
+@@ -620,6 +671,7 @@ import { initQuickPreview } from './cfg-quickpreview.js';
+       }
+       if (r.ok) {
+         resetApiFailures()
++        maybePromotePendingSessionKey(payload)
+         return { ok: true, status: r.status, payload }
+       }
+       handleApiFailure()
+@@ -2050,6 +2102,7 @@ import { initQuickPreview } from './cfg-quickpreview.js';
+     stopPollers()
+     sessionKey = null
+     safeLS('subscheck_api_key', null)
++    clearPendingSessionKey()
+     setAuthUI(false)
+     if (els.logContainer)
+       els.logContainer.innerHTML =
+@@ -2560,7 +2613,27 @@ import { initQuickPreview } from './cfg-quickpreview.js';
+       body: JSON.stringify({ content: formatted })
+     })
+     if (r.ok) {
+-      showToast(r.payload?.message || '保存成功', 'success')
++      const transition = r.payload?.auth_transition
++      if (transition?.changed) {
++        let desiredKey = ''
++        try { desiredKey = String(window.YAML.parse(formatted)?.['api-key'] || '').trim() }
++        catch { }
++        if (desiredKey) {
++          if (transition.state === 'applied') promoteSessionKey(desiredKey)
++          else stagePendingSessionKey(desiredKey, transition.desired_version)
++        }
++      }
++      const status = r.payload?.config_status
++      const detail = status?.state === 'pending-next-run'
++        ? '当前检测继续使用旧配置，结束后自动切换'
++        : status?.state === 'pending-service-reconfigure'
++          ? '配置已发布，托管服务正在切换运行规格'
++          : status?.state === 'restart-required'
++            ? `需重启：${(status.restart_required || []).join('、')}`
++            : status?.state === 'next-startup'
++              ? `下次启动生效：${(status.next_startup || []).join('、')}`
++              : ''
++      showToast([r.payload?.message || '保存成功', detail].filter(Boolean).join('；'), 'success', detail ? 5000 : 3000)
+       _cachedSubStoreConfig = null
+       cachedConfigPayload = null
+     } else {
+@@ -3498,6 +3571,10 @@ import { initQuickPreview } from './cfg-quickpreview.js';
+     const wailsKey = window.__WAILS_GUI?.apiKey || null
+     const sessionSaved = (() => { try { return sessionStorage.getItem('subscheck_session_key') } catch { return null } })()
+     const localSaved = safeLS('subscheck_api_key')
++    try {
++      pendingSessionKey = sessionStorage.getItem('subscheck_pending_api_key')
++      pendingSessionKeyVersion = Number(sessionStorage.getItem('subscheck_pending_api_key_version') || 0)
++    } catch { }
+     const saved = wailsKey || sessionSaved || localSaved
+ 
+     const apiKeyInput = document.getElementById('apiKeyInput');
+diff --git a/webui/static/js/config-form.js b/webui/static/js/config-form.js
+index 7e111e1..64958a6 100644
+--- a/webui/static/js/config-form.js
++++ b/webui/static/js/config-form.js
+@@ -339,8 +339,7 @@ const SCHEMA = [
+       {
+         title: 'GitHub Gist', conditional: 'gist',
+         fields: [
+-          { key: 'github-gist-id', label: 'Gist ID', type: 'text', placeholder: 'a1b2c3d4e5f6...' },
+-          { key: 'github-token', label: 'GitHub Token', type: 'password', placeholder: 'ghp_xxxxxxxxxxxx' },
++          { key: 'github-gist-id', label: 'Gist ID', type: 'text', placeholder: 'a1b2c3d4e5f6...', hint: 'GitHub Token 统一在“订阅 → 拉取基准”中配置，Gist 与订阅拉取共用同一个值' },
+           { key: 'github-api-mirror', label: 'API 镜像', type: 'text', placeholder: 'https://api.github.com/', hint: '可选，留空使用 api.github.com' },
+         ],
+       },
+@@ -2821,4 +2820,4 @@ function collectPanel(tabId) {
+   return out;
+ }
+ 
+-export { FIELD_VALIDATORS };
+\ No newline at end of file
++export { FIELD_VALIDATORS };
+diff --git a/webui/templates/admin.html b/webui/templates/admin.html
+index e210796..859b57f 100644
+--- a/webui/templates/admin.html
++++ b/webui/templates/admin.html
+@@ -748,9 +748,9 @@
+   <script src="/static/js/libs/codemirror.bundle.js?v20260324"></script>
+   <script src="/static/js/analysis.js?v20260606"></script>
+   <script src="/static/js/icons.js?v20260324"></script>
+-  <script type="module" src="/static/js/admin.js?v2026060601"></script>
++  <script type="module" src="/static/js/admin.js?v20260728-config-runtime"></script>
+   <script src="/static/js/reg-sw.js?v20260606"></script>
+   <!-- 侧边栏主题切换 & 登录框主题切换 代理到主按钮，并同步小屏 header 版本角标 -->
+ </body>
+ 
+-</html>
+\ No newline at end of file
++</html>

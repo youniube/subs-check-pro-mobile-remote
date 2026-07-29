@@ -1,0 +1,231 @@
+diff --git a/app/app.go b/app/app.go
+index 654e5b8..a0c468c 100644
+--- a/app/app.go
++++ b/app/app.go
+@@ -44,6 +44,12 @@ type App struct {
+ 	ticker        *time.Ticker
+ 	done          chan struct{} // 用于结束ticker goroutine的信号
+ 	cron          *cron.Cron    // crontab调度器（代理检测定时任务）
++	// appliedTimerCron/appliedTimerInterval record what the running scheduler
++	// actually uses. Config reload decisions must compare against these values
++	// rather than GlobalConfig, which may already contain newly loaded values.
++	appliedTimerCron     atomic.Value
++	appliedTimerInterval atomic.Int64
++	configReloadMu       sync.Mutex
+ 	// updateCron 版本更新定时任务调度器，独立存储以便 SetupUpdateTasks 重调时先停止旧实例，
+ 	// 避免每次配置变更触发重建时 goroutine 持续累积。
+ 	updateCron    *cron.Cron
+@@ -85,6 +91,22 @@ func New(originVersion string, version string, configPath string) *App {
+ 	}
+ }
+ 
++func normalizedCheckInterval(interval int) int {
++	if interval <= 0 {
++		return 2880
++	}
++	if interval <= 60 {
++		return 60
++	}
++	return interval
++}
++
++func (app *App) timerConfigMatches(cronExpression string, interval int) bool {
++	appliedCron, _ := app.appliedTimerCron.Load().(string)
++	return appliedCron == cronExpression &&
++		int(app.appliedTimerInterval.Load()) == interval
++}
++
+ // InitConfigLoad 初始化配置文件加载
+ func (app *App) InitConfigLoad() error {
+ 	// 初始化配置文件路径
+@@ -128,15 +150,7 @@ func (app *App) Initialize() error {
+ 		return fmt.Errorf("初始化配置文件监听失败: %w", err)
+ 	}
+ 
+-	app.interval = func() int {
+-		if config.GlobalConfig.CheckInterval <= 0 {
+-			return 2880
+-		}
+-		if config.GlobalConfig.CheckInterval <= 60 {
+-			return 60
+-		}
+-		return config.GlobalConfig.CheckInterval
+-	}()
++	app.interval = normalizedCheckInterval(config.GlobalConfig.CheckInterval)
+ 
+ 	if config.GlobalConfig.ListenPort != "" {
+ 		if err := app.initHTTPServer(); err != nil {
+@@ -276,6 +290,9 @@ func (app *App) GetConfigPath() string {
+ 
+ // setTimer 根据配置设置定时器
+ func (app *App) setTimer() {
++	cronExpression := config.GlobalConfig.CronExpression
++	interval := app.interval
++
+ 	// 停止现有定时器
+ 	if app.ticker != nil {
+ 		// 应该先发送停止信号，防止被=nil后panic
+@@ -292,17 +309,17 @@ func (app *App) setTimer() {
+ 	}
+ 
+ 	// 检查是否设置了cron表达式
+-	if config.GlobalConfig.CronExpression != "" {
+-		slog.Info("设置 cron 定时计划", "cron", config.GlobalConfig.CronExpression)
++	if cronExpression != "" {
++		slog.Info("设置 cron 定时计划", "cron", cronExpression)
+ 		app.cron = cron.New()
+-		_, err := app.cron.AddFunc(config.GlobalConfig.CronExpression, func() {
++		_, err := app.cron.AddFunc(cronExpression, func() {
+ 			app.triggerCheck()
+ 		})
+ 		if err != nil {
+ 			app.cron.Stop()
+ 			slog.Error(
+ 				"cron 表达式 '" +
+-					config.GlobalConfig.CronExpression +
++					cronExpression +
+ 					"' 解析失败: " +
+ 					err.Error() +
+ 					"，将使用检测间隔时间",
+@@ -317,6 +334,9 @@ func (app *App) setTimer() {
+ 		// 使用间隔时间
+ 		app.useIntervalTimer()
+ 	}
++
++	app.appliedTimerCron.Store(cronExpression)
++	app.appliedTimerInterval.Store(int64(interval))
+ }
+ 
+ // useIntervalTimer 使用间隔时间模式运行
+diff --git a/app/config.go b/app/config.go
+index 4a7b132..bdd1e30 100644
+--- a/app/config.go
++++ b/app/config.go
+@@ -232,8 +232,8 @@ func (app *App) pollConfigFile(ctx context.Context) {
+ 
+ // onConfigChange 配置文件变化时的统一响应逻辑，由 inotify 事件或轮询共同调用。
+ func (app *App) onConfigChange() {
+-	oldCronExpr := config.GlobalConfig.CronExpression
+-	oldInterval := app.interval
++	app.configReloadMu.Lock()
++	defer app.configReloadMu.Unlock()
+ 
+ 	oldUpdateSwitcher := config.GlobalConfig.EnableSelfUpdate
+ 	oldCronCheckUpdateExpr := config.GlobalConfig.CronCheckUpdate
+@@ -343,19 +343,12 @@ func (app *App) onConfigChange() {
+ 		assets.RunSubStoreService(app.ctx)
+ 	}
+ 
+-	// 检查cron表达式或检测间隔是否变化
+-	if oldCronExpr != config.GlobalConfig.CronExpression ||
+-		oldInterval != config.GlobalConfig.CheckInterval {
+-
+-		app.interval = func() int {
+-			if config.GlobalConfig.CheckInterval <= 0 {
+-				return 2880
+-			}
+-			if config.GlobalConfig.CheckInterval <= 60 {
+-				return 60
+-			}
+-			return config.GlobalConfig.CheckInterval
+-		}()
++	// Compare the desired configuration with the scheduler that is actually
++	// running. Comparing old/new GlobalConfig values can miss a change when a
++	// reload has already updated the global struct but not the timer.
++	nextInterval := normalizedCheckInterval(config.GlobalConfig.CheckInterval)
++	if !app.timerConfigMatches(config.GlobalConfig.CronExpression, nextInterval) {
++		app.interval = nextInterval
+ 		slog.Warn("检测设置发生变化，重新配置定时器")
+ 		app.setTimer()
+ 	}
+diff --git a/app/server.go b/app/server.go
+index 8477eba..fee3834 100644
+--- a/app/server.go
++++ b/app/server.go
+@@ -408,6 +408,10 @@ func (app *App) updateConfig(c *gin.Context) {
+ 		c.JSON(http.StatusInternalServerError, gin.H{"error": "保存配置文件失败" + err.Error()})
+ 		return
+ 	}
++
++	// Apply the saved configuration synchronously. The file watcher remains a
++	// fallback for external edits and becomes a no-op after this successful apply.
++	app.onConfigChange()
+ 	c.JSON(http.StatusOK, gin.H{"message": "配置已更新"})
+ }
+ 
+diff --git a/app/config_reload_test.go b/app/config_reload_test.go
+new file mode 100644
+index 0000000..d4d79dd
+--- /dev/null
++++ b/app/config_reload_test.go
+@@ -0,0 +1,70 @@
++package app
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/sinspired/subs-check-pro/v2/config"
++)
++
++func TestConfigReloadRepairsStaleCronTimer(t *testing.T) {
++	originalConfig := *config.GlobalConfig
++	defer func() {
++		*config.GlobalConfig = originalConfig
++	}()
++
++	const (
++		oldCron = "30 5 * * *"
++		newCron = "0 5,19 * * *"
++	)
++
++	configPath := filepath.Join(t.TempDir(), "config.yaml")
++	configData := []byte("cron-expression: \"" + newCron + "\"\ncheck-interval: 10080\n")
++	if err := os.WriteFile(configPath, configData, 0o600); err != nil {
++		t.Fatal(err)
++	}
++
++	*config.GlobalConfig = config.Config{
++		CronExpression: oldCron,
++		CheckInterval:  10080,
++	}
++	app := New("test", "test", configPath)
++	app.interval = normalizedCheckInterval(config.GlobalConfig.CheckInterval)
++	app.setTimer()
++	t.Cleanup(func() {
++		if app.cron != nil {
++			app.cron.Stop()
++		}
++		if app.ticker != nil {
++			app.ticker.Stop()
++		}
++	})
++
++	staleCron := app.cron
++	if staleCron == nil {
++		t.Fatal("old cron scheduler was not created")
++	}
++
++	// Reproduce the field evidence: the global config already contains the saved
++	// expression while the scheduler still runs the previous expression.
++	config.GlobalConfig.CronExpression = newCron
++	app.onConfigChange()
++
++	if app.cron == nil {
++		t.Fatal("new cron scheduler was not created")
++	}
++	if app.cron == staleCron {
++		t.Fatal("stale cron scheduler was not replaced")
++	}
++	appliedCron, _ := app.appliedTimerCron.Load().(string)
++	if appliedCron != newCron {
++		t.Fatalf("applied cron = %q, want %q", appliedCron, newCron)
++	}
++	if app.appliedTimerInterval.Load() != 10080 {
++		t.Fatalf("applied interval = %d, want 10080", app.appliedTimerInterval.Load())
++	}
++	if got := config.GlobalConfig.CronExpression; got != newCron {
++		t.Fatalf("loaded cron = %q, want %q", got, newCron)
++	}
++}

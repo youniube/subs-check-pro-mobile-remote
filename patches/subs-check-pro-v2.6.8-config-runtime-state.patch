@@ -1,0 +1,615 @@
+diff --git a/app/app.go b/app/app.go
+index a0c468c..9db3c92 100644
+--- a/app/app.go
++++ b/app/app.go
+@@ -50,6 +50,14 @@ type App struct {
+ 	appliedTimerCron     atomic.Value
+ 	appliedTimerInterval atomic.Int64
+ 	configReloadMu       sync.Mutex
++	configVersion        atomic.Uint64
++	appliedConfigVersion atomic.Uint64
++	checkConfigVersion   atomic.Uint64
++	desiredConfig        *config.Config
++	appliedConfig        *config.Config
++	pendingConfig        *config.Config
++	pendingConfigVersion uint64
++	startupConfig        *config.Config
+ 	// updateCron 版本更新定时任务调度器，独立存储以便 SetupUpdateTasks 重调时先停止旧实例，
+ 	// 避免每次配置变更触发重建时 goroutine 持续累积。
+ 	updateCron    *cron.Cron
+@@ -369,12 +377,11 @@ func (app *App) TriggerCheck() {
+ 
+ // triggerCheck 内部检测方法
+ func (app *App) triggerCheck() {
+-	// 如果已经在检测中，直接返回
+-	if !app.checking.CompareAndSwap(false, true) {
++	if !app.beginCheck() {
+ 		slog.Warn("已有检测正在进行，跳过本次检测")
+ 		return
+ 	}
+-	defer app.checking.Store(false)
++	defer app.finishCheck()
+ 
+ 	if err := app.checkProxies(); err != nil {
+ 		slog.Error("检测代理失败", "error", err)
+diff --git a/app/config.go b/app/config.go
+index bdd1e30..5edc59e 100644
+--- a/app/config.go
++++ b/app/config.go
+@@ -31,28 +31,44 @@ func (app *App) initConfigPath() error {
+ 	return nil
+ }
+ 
+-// loadConfig 加载配置文件
+-func (app *App) loadConfig() error {
++func (app *App) readConfigFile() (*config.Config, error) {
+ 	yamlFile, err := os.ReadFile(app.configPath)
+ 	if err != nil {
+ 		if os.IsNotExist(err) {
+-			return app.createDefaultConfig()
++			return nil, app.createDefaultConfig()
+ 		}
+-		return fmt.Errorf("读取配置文件失败: %w", err)
++		return nil, fmt.Errorf("读取配置文件失败: %w", err)
+ 	}
+ 
+-	// 为避免旧配置残留，反序列化到新的实例，然后替换全局配置
+-	// 先拷贝一份默认值
+ 	newConfig := *config.OriginDefaultConfig
+ 	if err := yaml.Unmarshal(yamlFile, &newConfig); err != nil {
+-		return fmt.Errorf("解析配置文件失败: %w", err)
++		return nil, fmt.Errorf("解析配置文件失败: %w", err)
+ 	}
+-	*config.GlobalConfig = newConfig
++	newConfig.ConfigDir = filepath.Dir(app.configPath)
++	return cloneConfig(&newConfig), nil
++}
+ 
+-	// 注入运行时字段：ConfigDir 用于 NewLocalSaver 计算默认输出路径。
+-	// yaml:"-" 保证其不被反序列化覆盖，此处每次加载后手动填充。
+-	config.GlobalConfig.ConfigDir = filepath.Dir(app.configPath)
++// loadConfig performs the initial configuration publication. Runtime reloads
++// must go through onConfigChange so an active check cannot observe a partial
++// old/new configuration.
++func (app *App) loadConfig() error {
++	newConfig, err := app.readConfigFile()
++	if err != nil {
++		return err
++	}
+ 
++	app.configReloadMu.Lock()
++	defer app.configReloadMu.Unlock()
++	*config.GlobalConfig = *cloneConfig(newConfig)
++	app.desiredConfig = cloneConfig(newConfig)
++	app.appliedConfig = cloneConfig(newConfig)
++	if app.startupConfig == nil {
++		app.startupConfig = cloneConfig(newConfig)
++	}
++	if app.configVersion.Load() == 0 {
++		app.configVersion.Store(1)
++		app.appliedConfigVersion.Store(1)
++	}
+ 	slog.Info("配置文件读取成功")
+ 	return nil
+ }
+@@ -171,7 +187,9 @@ func (app *App) initConfigWatcher() error {
+ 					// 创建新的定时器，延迟100ms执行
+ 					debounceTimer = time.AfterFunc(100*time.Millisecond, func() {
+ 						slog.Info("配置文件发生变化，正在重新加载")
+-						app.onConfigChange()
++						if _, err := app.onConfigChange(); err != nil {
++							slog.Error("重新加载配置文件失败", "error", err)
++						}
+ 					})
+ 				}
+ 			case err, ok := <-watcher.Errors:
+@@ -221,7 +239,9 @@ func (app *App) pollConfigFile(ctx context.Context) {
+ 			if info.ModTime().After(lastMod) {
+ 				lastMod = info.ModTime()
+ 				slog.Info("配置文件发生变化（轮询检测），正在重新加载")
+-				app.onConfigChange()
++				if _, err := app.onConfigChange(); err != nil {
++					slog.Error("重新加载配置文件失败", "error", err)
++				}
+ 			}
+ 		case <-ctx.Done():
+ 			slog.Info("配置文件轮询监听已停止")
+@@ -230,20 +250,45 @@ func (app *App) pollConfigFile(ctx context.Context) {
+ 	}
+ }
+ 
+-// onConfigChange 配置文件变化时的统一响应逻辑，由 inotify 事件或轮询共同调用。
+-func (app *App) onConfigChange() {
++// onConfigChange is the only runtime path that publishes file changes.
++// While a check is active, the parsed configuration is retained as the next
++// desired version and applied only after that check has fully finished.
++func (app *App) onConfigChange() (configApplyStatus, error) {
++	nextConfig, err := app.readConfigFile()
++	if err != nil {
++		return app.configStatus(), err
++	}
++
+ 	app.configReloadMu.Lock()
+ 	defer app.configReloadMu.Unlock()
+ 
++	if configsEqual(app.desiredConfig, nextConfig) {
++		return app.configStatusLocked(), nil
++	}
++
++	version := app.configVersion.Add(1)
++	app.desiredConfig = cloneConfig(nextConfig)
++	if app.checking.Load() {
++		app.pendingConfig = cloneConfig(nextConfig)
++		app.pendingConfigVersion = version
++		slog.Info("配置已保存，将在当前检测结束后生效", "config-version", version)
++		return app.configStatusLocked(), nil
++	}
++
++	app.pendingConfig = nil
++	app.pendingConfigVersion = 0
++	app.applyRuntimeConfigLocked(nextConfig, version)
++	return app.configStatusLocked(), nil
++}
++
++func (app *App) applyRuntimeConfigLocked(nextConfig *config.Config, version uint64) {
+ 	oldUpdateSwitcher := config.GlobalConfig.EnableSelfUpdate
+ 	oldCronCheckUpdateExpr := config.GlobalConfig.CronCheckUpdate
+ 	oldSubStorePath := config.GlobalConfig.SubStorePath
+ 	oldSubStorePort := config.GlobalConfig.SubStorePort
+ 
+-	if err := app.loadConfig(); err != nil {
+-		slog.Error("重新加载配置文件失败", "error", err)
+-		return
+-	}
++	effectiveConfig := app.effectiveConfigLocked(nextConfig)
++	*config.GlobalConfig = *effectiveConfig
+ 
+ 	// 去掉开头的冒号，统一格式
+ 	subStorePort := strings.TrimPrefix(config.GlobalConfig.SubStorePort, ":")
+@@ -357,4 +402,8 @@ func (app *App) onConfigChange() {
+ 		slog.Warn("版本更新设置发生变化，重新设置定时更新任务")
+ 		app.SetupUpdateTasks()
+ 	}
++
++	app.appliedConfig = cloneConfig(config.GlobalConfig)
++	app.appliedConfigVersion.Store(version)
++	slog.Info("运行配置已应用", "config-version", version)
+ }
+diff --git a/app/config_runtime.go b/app/config_runtime.go
+new file mode 100644
+index 0000000..e97a5d5
+--- /dev/null
++++ b/app/config_runtime.go
+@@ -0,0 +1,129 @@
++package app
++
++import (
++	"reflect"
++	"slices"
++
++	"github.com/sinspired/subs-check-pro/v2/config"
++)
++
++const (
++	configStateApplied        = "applied"
++	configStatePendingNextRun = "pending-next-run"
++	configStateRestartNeeded  = "restart-required"
++)
++
++type configApplyStatus struct {
++	State           string   `json:"state"`
++	DesiredVersion  uint64   `json:"desired_version"`
++	AppliedVersion  uint64   `json:"applied_version"`
++	CheckVersion    uint64   `json:"check_version,omitempty"`
++	Pending         bool     `json:"pending"`
++	RestartRequired []string `json:"restart_required"`
++}
++
++func cloneConfig(src *config.Config) *config.Config {
++	if src == nil {
++		return nil
++	}
++	dst := *src
++	dst.SubUrlsRemote = slices.Clone(src.SubUrlsRemote)
++	dst.SubUrls = slices.Clone(src.SubUrls)
++	dst.RecipientURL = slices.Clone(src.RecipientURL)
++	dst.Platforms = slices.Clone(src.Platforms)
++	dst.NodeType = slices.Clone(src.NodeType)
++	dst.NodeLoc = slices.Clone(src.NodeLoc)
++	dst.GithubProxyGroup = slices.Clone(src.GithubProxyGroup)
++	dst.SubProcess.RegexFilter = slices.Clone(src.SubProcess.RegexFilter)
++	dst.SubProcess.RegexSort = slices.Clone(src.SubProcess.RegexSort)
++	return &dst
++}
++
++func configsEqual(a, b *config.Config) bool {
++	return reflect.DeepEqual(a, b)
++}
++
++func (app *App) beginCheck() bool {
++	app.configReloadMu.Lock()
++	defer app.configReloadMu.Unlock()
++
++	if app.checking.Load() {
++		return false
++	}
++	app.checking.Store(true)
++	app.checkConfigVersion.Store(app.appliedConfigVersion.Load())
++	return true
++}
++
++func (app *App) finishCheck() {
++	app.configReloadMu.Lock()
++	defer app.configReloadMu.Unlock()
++
++	app.checking.Store(false)
++	app.checkConfigVersion.Store(0)
++	if app.pendingConfig == nil {
++		return
++	}
++
++	next := app.pendingConfig
++	version := app.pendingConfigVersion
++	app.pendingConfig = nil
++	app.pendingConfigVersion = 0
++	app.applyRuntimeConfigLocked(next, version)
++}
++
++func (app *App) effectiveConfigLocked(desired *config.Config) *config.Config {
++	effective := cloneConfig(desired)
++	if effective == nil || app.startupConfig == nil {
++		return effective
++	}
++
++	// These values describe resources created during process startup. Until the
++	// corresponding managers support safe live reconfiguration, keep runtime
++	// consumers on the values that are actually active and report a restart.
++	effective.ListenPort = app.startupConfig.ListenPort
++	effective.EnableWebUI = app.startupConfig.EnableWebUI
++	effective.OutputDir = app.startupConfig.OutputDir
++	return effective
++}
++
++func (app *App) restartRequiredFieldsLocked() []string {
++	if app.startupConfig == nil || app.desiredConfig == nil {
++		return []string{}
++	}
++	fields := make([]string, 0, 3)
++	if app.startupConfig.ListenPort != app.desiredConfig.ListenPort {
++		fields = append(fields, "listen-port")
++	}
++	if app.startupConfig.EnableWebUI != app.desiredConfig.EnableWebUI {
++		fields = append(fields, "enable-web-ui")
++	}
++	if app.startupConfig.OutputDir != app.desiredConfig.OutputDir {
++		fields = append(fields, "output-dir")
++	}
++	return fields
++}
++
++func (app *App) configStatusLocked() configApplyStatus {
++	restartRequired := app.restartRequiredFieldsLocked()
++	state := configStateApplied
++	if app.pendingConfig != nil {
++		state = configStatePendingNextRun
++	} else if len(restartRequired) > 0 {
++		state = configStateRestartNeeded
++	}
++	return configApplyStatus{
++		State:           state,
++		DesiredVersion:  app.configVersion.Load(),
++		AppliedVersion:  app.appliedConfigVersion.Load(),
++		CheckVersion:    app.checkConfigVersion.Load(),
++		Pending:         app.pendingConfig != nil,
++		RestartRequired: restartRequired,
++	}
++}
++
++func (app *App) configStatus() configApplyStatus {
++	app.configReloadMu.Lock()
++	defer app.configReloadMu.Unlock()
++	return app.configStatusLocked()
++}
+diff --git a/app/config_runtime_test.go b/app/config_runtime_test.go
+new file mode 100644
+index 0000000..af0e16b
+--- /dev/null
++++ b/app/config_runtime_test.go
+@@ -0,0 +1,226 @@
++package app
++
++import (
++	"os"
++	"path/filepath"
++	"slices"
++	"sync"
++	"testing"
++
++	"github.com/sinspired/subs-check-pro/v2/config"
++)
++
++func writeRuntimeConfig(t *testing.T, path, content string) {
++	t.Helper()
++	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func newRuntimeConfigTestApp(t *testing.T, content string) *App {
++	t.Helper()
++	originalConfig := *config.GlobalConfig
++	t.Cleanup(func() {
++		*config.GlobalConfig = originalConfig
++	})
++
++	configPath := filepath.Join(t.TempDir(), "config.yaml")
++	writeRuntimeConfig(t, configPath, content)
++	app := New("test", "test", configPath)
++	if err := app.loadConfig(); err != nil {
++		t.Fatal(err)
++	}
++	app.interval = normalizedCheckInterval(config.GlobalConfig.CheckInterval)
++	app.setTimer()
++	t.Cleanup(func() {
++		if app.cron != nil {
++			app.cron.Stop()
++		}
++		if app.ticker != nil {
++			app.ticker.Stop()
++		}
++	})
++	return app
++}
++
++func TestCloneConfigDeepCopiesSlices(t *testing.T) {
++	src := &config.Config{
++		SubUrls:          []string{"a"},
++		RecipientURL:     []string{"b"},
++		GithubProxyGroup: []string{"c"},
++		SubProcess: config.SubProcessConfig{
++			RegexFilter: []string{"d"},
++			RegexSort:   []string{"e"},
++		},
++	}
++	dst := cloneConfig(src)
++	src.SubUrls[0] = "changed"
++	src.RecipientURL[0] = "changed"
++	src.GithubProxyGroup[0] = "changed"
++	src.SubProcess.RegexFilter[0] = "changed"
++	src.SubProcess.RegexSort[0] = "changed"
++
++	if !slices.Equal(dst.SubUrls, []string{"a"}) ||
++		!slices.Equal(dst.RecipientURL, []string{"b"}) ||
++		!slices.Equal(dst.GithubProxyGroup, []string{"c"}) ||
++		!slices.Equal(dst.SubProcess.RegexFilter, []string{"d"}) ||
++		!slices.Equal(dst.SubProcess.RegexSort, []string{"e"}) {
++		t.Fatal("cloneConfig shares slice storage with its source")
++	}
++}
++
++func TestConfigReloadDefersPublicationUntilCheckFinishes(t *testing.T) {
++	const oldConfig = `
++cron-expression: "0 5 * * *"
++check-interval: 10080
++timeout: 1000
++listen-port: "127.0.0.1:8199"
++enable-web-ui: true
++output-dir: "old-output"
++sub-store-port: ""
++`
++	const newConfig = `
++cron-expression: "0 5 * * *"
++check-interval: 10080
++timeout: 9000
++listen-port: "127.0.0.1:8199"
++enable-web-ui: true
++output-dir: "old-output"
++sub-store-port: ""
++`
++	app := newRuntimeConfigTestApp(t, oldConfig)
++	if !app.beginCheck() {
++		t.Fatal("check did not start")
++	}
++	writeRuntimeConfig(t, app.configPath, newConfig)
++
++	status, err := app.onConfigChange()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if status.State != configStatePendingNextRun || !status.Pending {
++		t.Fatalf("status = %#v, want pending-next-run", status)
++	}
++	if got := config.GlobalConfig.Timeout; got != 1000 {
++		t.Fatalf("active timeout changed during check: %d", got)
++	}
++	if status.DesiredVersion != 2 || status.AppliedVersion != 1 || status.CheckVersion != 1 {
++		t.Fatalf("unexpected versions while pending: %#v", status)
++	}
++
++	app.finishCheck()
++	if got := config.GlobalConfig.Timeout; got != 9000 {
++		t.Fatalf("pending timeout was not applied: %d", got)
++	}
++	status = app.configStatus()
++	if status.Pending || status.State != configStateApplied {
++		t.Fatalf("status after check = %#v, want applied", status)
++	}
++	if status.DesiredVersion != 2 || status.AppliedVersion != 2 || status.CheckVersion != 0 {
++		t.Fatalf("unexpected versions after apply: %#v", status)
++	}
++}
++
++func TestStartupBoundFieldsRemainOnActuallyRunningValues(t *testing.T) {
++	const oldConfig = `
++cron-expression: "0 5 * * *"
++check-interval: 10080
++listen-port: "127.0.0.1:8199"
++enable-web-ui: true
++output-dir: "old-output"
++sub-store-port: ""
++`
++	const newConfig = `
++cron-expression: "0 5 * * *"
++check-interval: 10080
++listen-port: "127.0.0.1:9199"
++enable-web-ui: false
++output-dir: "new-output"
++sub-store-port: ""
++`
++	app := newRuntimeConfigTestApp(t, oldConfig)
++	writeRuntimeConfig(t, app.configPath, newConfig)
++	status, err := app.onConfigChange()
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if status.State != configStateRestartNeeded {
++		t.Fatalf("state = %q, want %q", status.State, configStateRestartNeeded)
++	}
++	wantRestart := []string{"listen-port", "enable-web-ui", "output-dir"}
++	if !slices.Equal(status.RestartRequired, wantRestart) {
++		t.Fatalf("restart fields = %#v, want %#v", status.RestartRequired, wantRestart)
++	}
++	if config.GlobalConfig.ListenPort != "127.0.0.1:8199" ||
++		!config.GlobalConfig.EnableWebUI ||
++		config.GlobalConfig.OutputDir != "old-output" {
++		t.Fatalf("startup-bound runtime fields changed: %#v", config.GlobalConfig)
++	}
++}
++
++func TestInvalidReloadKeepsCurrentRuntimeConfig(t *testing.T) {
++	const oldConfig = `
++cron-expression: "0 5 * * *"
++check-interval: 10080
++timeout: 1000
++sub-store-port: ""
++`
++	app := newRuntimeConfigTestApp(t, oldConfig)
++	writeRuntimeConfig(t, app.configPath, "timeout: [not-an-integer]\n")
++
++	status, err := app.onConfigChange()
++	if err == nil {
++		t.Fatal("invalid config unexpectedly loaded")
++	}
++	if config.GlobalConfig.Timeout != 1000 {
++		t.Fatalf("runtime timeout changed after invalid reload: %d", config.GlobalConfig.Timeout)
++	}
++	if status.DesiredVersion != 1 || status.AppliedVersion != 1 || status.Pending {
++		t.Fatalf("status changed after invalid reload: %#v", status)
++	}
++}
++
++func TestConcurrentEquivalentReloadsCreateOnePendingVersion(t *testing.T) {
++	const oldConfig = `
++cron-expression: "0 5 * * *"
++check-interval: 10080
++timeout: 1000
++sub-store-port: ""
++`
++	const newConfig = `
++cron-expression: "0 5 * * *"
++check-interval: 10080
++timeout: 2000
++sub-store-port: ""
++`
++	app := newRuntimeConfigTestApp(t, oldConfig)
++	if !app.beginCheck() {
++		t.Fatal("check did not start")
++	}
++	writeRuntimeConfig(t, app.configPath, newConfig)
++
++	var wg sync.WaitGroup
++	errs := make(chan error, 20)
++	for range 20 {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			_, err := app.onConfigChange()
++			errs <- err
++		}()
++	}
++	wg.Wait()
++	close(errs)
++	for err := range errs {
++		if err != nil {
++			t.Fatal(err)
++		}
++	}
++
++	status := app.configStatus()
++	if status.DesiredVersion != 2 || status.AppliedVersion != 1 || !status.Pending {
++		t.Fatalf("equivalent reloads created extra versions: %#v", status)
++	}
++	app.finishCheck()
++}
+diff --git a/app/server.go b/app/server.go
+index fee3834..b91c6b6 100644
+--- a/app/server.go
++++ b/app/server.go
+@@ -355,9 +355,17 @@ func (app *App) getConfig(c *gin.Context) {
+ 		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取配置文件失败" + err.Error()})
+ 		return
+ 	}
++	app.configReloadMu.Lock()
++	status := app.configStatusLocked()
++	subStorePath := ""
++	if app.appliedConfig != nil {
++		subStorePath = app.appliedConfig.SubStorePath
++	}
++	app.configReloadMu.Unlock()
+ 	c.JSON(http.StatusOK, gin.H{
+ 		"content":        string(configData),
+-		"sub_store_path": config.GlobalConfig.SubStorePath,
++		"sub_store_path": subStorePath,
++		"config_status":  status,
+ 	})
+ }
+ 
+@@ -375,6 +383,11 @@ func (app *App) updateConfig(c *gin.Context) {
+ 		c.JSON(http.StatusBadRequest, gin.H{"error": "YAML格式错误: " + err.Error()})
+ 		return
+ 	}
++	validatedConfig := *config.OriginDefaultConfig
++	if err := yaml.Unmarshal([]byte(req.Content), &validatedConfig); err != nil {
++		c.JSON(http.StatusBadRequest, gin.H{"error": "配置字段类型错误: " + err.Error()})
++		return
++	}
+ 
+ 	var nextConfig struct {
+ 		SubURLs []string `yaml:"sub-urls"`
+@@ -409,10 +422,23 @@ func (app *App) updateConfig(c *gin.Context) {
+ 		return
+ 	}
+ 
+-	// Apply the saved configuration synchronously. The file watcher remains a
+-	// fallback for external edits and becomes a no-op after this successful apply.
+-	app.onConfigChange()
+-	c.JSON(http.StatusOK, gin.H{"message": "配置已更新"})
++	status, err := app.onConfigChange()
++	if err != nil {
++		c.JSON(http.StatusInternalServerError, gin.H{
++			"error": "配置已写入，但运行时加载失败: " + err.Error(),
++		})
++		return
++	}
++	message := "配置已更新并生效"
++	if status.Pending {
++		message = "配置已保存，将在当前检测结束后生效"
++	} else if len(status.RestartRequired) > 0 {
++		message = "配置已保存；部分设置需重启后生效"
++	}
++	c.JSON(http.StatusOK, gin.H{
++		"message":       message,
++		"config_status": status,
++	})
+ }
+ 
+ // getStatus 获取检测状态
+@@ -445,6 +471,7 @@ func (app *App) getStatus(c *gin.Context) {
+ 		"lastCheck":         lastCheck,
+ 		"isSubStoreRunning": assets.IsSubStoreRunning.Load(),
+ 		"eta":               check.ETASeconds.Load(), // -1=计算中, 0=完成, >0=剩余秒
++		"configStatus":      app.configStatus(),
+ 	})
+ }
+ 

@@ -1,5 +1,6 @@
 # Runtime binaries and generated state
 runtime/bin/
+runtime/backups/
 runtime/logs/
 runtime/output/
 runtime/*.lock

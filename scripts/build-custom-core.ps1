@@ -1,5 +1,7 @@
 [CmdletBinding()]
-param()
+param(
+    [switch]$RunRaceTests
+)
 
 $ErrorActionPreference = 'Stop'
 $workspace = Split-Path -Parent $PSScriptRoot
@@ -12,11 +14,19 @@ $corePatches = @(
     (Join-Path $workspace 'patches\subs-check-pro-v2.6.8-subscription-history.patch'),
     (Join-Path $workspace 'patches\subs-check-pro-v2.6.8-ua-fallback.patch'),
     (Join-Path $workspace 'patches\subs-check-pro-v2.6.8-loopback-history.patch'),
-    (Join-Path $workspace 'patches\subs-check-pro-v2.6.8-clean-internal-tags.patch')
+    (Join-Path $workspace 'patches\subs-check-pro-v2.6.8-clean-internal-tags.patch'),
+    (Join-Path $workspace 'patches\subs-check-pro-v2.6.8-silent-subscription-archive.patch'),
+    (Join-Path $workspace 'patches\subs-check-pro-v2.6.8-cron-hot-reload.patch'),
+    (Join-Path $workspace 'patches\subs-check-pro-v2.6.8-config-runtime-state.patch'),
+    (Join-Path $workspace 'patches\subs-check-pro-v2.6.8-substore-runtime-manager.patch'),
+    (Join-Path $workspace 'patches\subs-check-pro-v2.6.8-runtime-address-output.patch'),
+    (Join-Path $workspace 'patches\subs-check-pro-v2.6.8-webui-config-semantics.patch'),
+    (Join-Path $workspace 'patches\subs-check-pro-v2.6.8-substore-mailbox-race.patch')
 )
 $webuiPatches = @(
     (Join-Path $workspace 'patches\subs-check-pro-webui-b8db5f51c367-analysis-report.patch'),
-    (Join-Path $workspace 'patches\subs-check-pro-webui-b8db5f51c367-subscription-history.patch')
+    (Join-Path $workspace 'patches\subs-check-pro-webui-b8db5f51c367-subscription-history.patch'),
+    (Join-Path $workspace 'patches\subs-check-pro-webui-b8db5f51c367-config-semantics.patch')
 )
 $destination = Join-Path $workspace 'runtime\bin\subs-check-pro-custom-v2.6.8.exe'
 $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
@@ -112,13 +122,52 @@ try {
         & go mod edit '-replace=github.com/sinspired/subs-check-pro-webui=./_webui'
         if ($LASTEXITCODE -ne 0) { throw 'WebUI module replacement failed' }
 
+        Push-Location -LiteralPath $webuiDir
+        try {
+            & go test ./webui
+            if ($LASTEXITCODE -ne 0) { throw 'WebUI tests failed' }
+        } finally {
+            Pop-Location
+        }
+
         # Upstream ISP tests call ipapi.is directly and fail when that third-party
         # service is slow or unavailable. Keep the deterministic proxy tests,
         # including local-history tag behavior, in the build gate.
+        & go test ./app
+        if ($LASTEXITCODE -ne 0) { throw 'App tests failed' }
         & go test ./proxy -skip 'Test(CurrentIP|SpecificIP|GetISPInfo)$'
         if ($LASTEXITCODE -ne 0) { throw 'Proxy tests failed' }
         & go test ./check
         if ($LASTEXITCODE -ne 0) { throw 'Check tests failed' }
+
+        if ($RunRaceTests) {
+            $gccCommand = Get-Command gcc -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $gccCommand) {
+                throw 'Race tests require gcc.exe in PATH'
+            }
+            $syncLibrary = ((& $gccCommand.Source --print-file-name libsynchronization.a) | Out-String).Trim()
+            if ([string]::IsNullOrWhiteSpace($syncLibrary) -or
+                $syncLibrary -eq 'libsynchronization.a' -or
+                -not (Test-Path -LiteralPath $syncLibrary -PathType Leaf)) {
+                throw 'Race tests require mingw-w64 runtime libraries with libsynchronization.a'
+            }
+
+            $previousCgoEnabled = $env:CGO_ENABLED
+            $previousCC = $env:CC
+            try {
+                $env:CGO_ENABLED = '1'
+                $env:CC = $gccCommand.Source
+                & go test -race ./app -count=5 -timeout=3m
+                if ($LASTEXITCODE -ne 0) { throw 'App race tests failed' }
+                & go test -race ./proxy -skip 'Test(CurrentIP|SpecificIP|GetISPInfo)$' -count=1 -timeout=5m
+                if ($LASTEXITCODE -ne 0) { throw 'Proxy race tests failed' }
+                & go test -race ./check -count=1 -timeout=5m
+                if ($LASTEXITCODE -ne 0) { throw 'Check race tests failed' }
+            } finally {
+                $env:CGO_ENABLED = $previousCgoEnabled
+                $env:CC = $previousCC
+            }
+        }
 
         $goBin = Join-Path (& go env GOPATH) 'bin'
         $winres = Join-Path $goBin 'go-winres.exe'
@@ -136,7 +185,7 @@ try {
 
         $built = Join-Path $buildDir 'subs-check-pro-custom.exe'
         & go build -trimpath `
-            -ldflags ("-s -w -X main.Version=$upstreamVersion+custom.history.ua2.loopback1.cleantags1 -X main.CurrentCommit=$upstreamCommit-custom") `
+            -ldflags ("-s -w -X main.Version=$upstreamVersion+custom.history.ua2.loopback1.cleantags1.silentarchive1.remotefilter1.cronreload1.configstate1.substore1.addrout1.configsem1.subrace1 -X main.CurrentCommit=$upstreamCommit-custom") `
             -o $built .
         if ($LASTEXITCODE -ne 0) { throw 'go build failed' }
 

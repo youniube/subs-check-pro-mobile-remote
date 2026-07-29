@@ -1,0 +1,1065 @@
+diff --git a/app/app.go b/app/app.go
+index 269f847..69a9b25 100644
+--- a/app/app.go
++++ b/app/app.go
+@@ -99,7 +99,7 @@ func New(originVersion string, version string, configPath string) *App {
+ 		version:       version,
+ 		originVersion: originVersion,
+ 	}
+-	app.subStoreManager = newSubStoreManager(assets.RunSubStoreService, assets.KillNode)
++	app.subStoreManager = newSubStoreManager(assets.RunSubStoreService, assets.KillNodeForSpec)
+ 	return app
+ }
+ 
+@@ -550,7 +550,7 @@ func (app *App) Shutdown() error {
+ 			lastErr = errors.New("关闭 HTTP 服务器失败: " + err.Error())
+ 			slog.Error("关闭 HTTP 服务器失败", "err", err)
+ 		} else {
+-			listenPort := strings.TrimPrefix(config.GlobalConfig.ListenPort, ":")
++			_, listenPort, _ := utils.ParseListenAddress(config.GlobalConfig.ListenPort, DefaultPort)
+ 			slog.Info("HTTP 服务器关闭", "port", listenPort)
+ 		}
+ 	}
+diff --git a/app/config.go b/app/config.go
+index 99f0fbf..13b2d87 100644
+--- a/app/config.go
++++ b/app/config.go
+@@ -289,12 +289,11 @@ func (app *App) applyRuntimeConfigLocked(nextConfig *config.Config, version uint
+ 	effectiveConfig := app.effectiveConfigLocked(nextConfig)
+ 	*config.GlobalConfig = *effectiveConfig
+ 
+-	// 去掉开头的冒号，统一格式
+-	subStorePort := strings.TrimPrefix(config.GlobalConfig.SubStorePort, ":")
+-	listenPort := strings.TrimPrefix(config.GlobalConfig.ListenPort, ":")
++	_, subStorePort, subStorePortErr := utils.ParseListenAddress(config.GlobalConfig.SubStorePort, "")
++	_, listenPort, listenPortErr := utils.ParseListenAddress(config.GlobalConfig.ListenPort, DefaultPort)
+ 
+ 	// 校验两个端口不能相同
+-	if subStorePort != "" && listenPort != "" && subStorePort == listenPort {
++	if subStorePortErr == nil && listenPortErr == nil && subStorePort == listenPort {
+ 		slog.Error("SubStore端口 与 WebUI端口 冲突，请修改配置",
+ 			"ListenPort", listenPort,
+ 			"SubStorePort", subStorePort,
+diff --git a/app/config_runtime.go b/app/config_runtime.go
+index ac0d58f..1d0305c 100644
+--- a/app/config_runtime.go
++++ b/app/config_runtime.go
+@@ -85,7 +85,6 @@ func (app *App) effectiveConfigLocked(desired *config.Config) *config.Config {
+ 	// consumers on the values that are actually active and report a restart.
+ 	effective.ListenPort = app.startupConfig.ListenPort
+ 	effective.EnableWebUI = app.startupConfig.EnableWebUI
+-	effective.OutputDir = app.startupConfig.OutputDir
+ 	return effective
+ }
+ 
+@@ -93,16 +92,13 @@ func (app *App) restartRequiredFieldsLocked() []string {
+ 	if app.startupConfig == nil || app.desiredConfig == nil {
+ 		return []string{}
+ 	}
+-	fields := make([]string, 0, 3)
++	fields := make([]string, 0, 2)
+ 	if app.startupConfig.ListenPort != app.desiredConfig.ListenPort {
+ 		fields = append(fields, "listen-port")
+ 	}
+ 	if app.startupConfig.EnableWebUI != app.desiredConfig.EnableWebUI {
+ 		fields = append(fields, "enable-web-ui")
+ 	}
+-	if app.startupConfig.OutputDir != app.desiredConfig.OutputDir {
+-		fields = append(fields, "output-dir")
+-	}
+ 	return fields
+ }
+ 
+diff --git a/app/config_runtime_test.go b/app/config_runtime_test.go
+index e8e33af..e0cf7b3 100644
+--- a/app/config_runtime_test.go
++++ b/app/config_runtime_test.go
+@@ -155,15 +155,17 @@ sub-store-port: ""
+ 	if status.State != configStateRestartNeeded {
+ 		t.Fatalf("state = %q, want %q", status.State, configStateRestartNeeded)
+ 	}
+-	wantRestart := []string{"listen-port", "enable-web-ui", "output-dir"}
++	wantRestart := []string{"listen-port", "enable-web-ui"}
+ 	if !slices.Equal(status.RestartRequired, wantRestart) {
+ 		t.Fatalf("restart fields = %#v, want %#v", status.RestartRequired, wantRestart)
+ 	}
+ 	if config.GlobalConfig.ListenPort != "127.0.0.1:8199" ||
+-		!config.GlobalConfig.EnableWebUI ||
+-		config.GlobalConfig.OutputDir != "old-output" {
++		!config.GlobalConfig.EnableWebUI {
+ 		t.Fatalf("startup-bound runtime fields changed: %#v", config.GlobalConfig)
+ 	}
++	if config.GlobalConfig.OutputDir != "new-output" {
++		t.Fatalf("output-dir did not apply live: %q", config.GlobalConfig.OutputDir)
++	}
+ }
+ 
+ func TestInvalidReloadKeepsCurrentRuntimeConfig(t *testing.T) {
+diff --git a/app/output_reload_test.go b/app/output_reload_test.go
+new file mode 100644
+index 0000000..ebce096
+--- /dev/null
++++ b/app/output_reload_test.go
+@@ -0,0 +1,101 @@
++package app
++
++import (
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/gin-gonic/gin"
++)
++
++func TestStaticDownloadRouteFollowsAppliedOutputDirectory(t *testing.T) {
++	oldOutput := filepath.Join(t.TempDir(), "old-output")
++	newOutput := filepath.Join(t.TempDir(), "new-output")
++	if err := os.MkdirAll(oldOutput, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.MkdirAll(newOutput, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	const fileName = "Sinspired_Rules_CDN.yaml"
++	if err := os.WriteFile(filepath.Join(oldOutput, fileName), []byte("old-directory"), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(newOutput, fileName), []byte("new-directory"), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	for directory, content := range map[string]string{
++		oldOutput: "old-share",
++		newOutput: "new-share",
++	} {
++		moreDir := filepath.Join(directory, ShareDirName)
++		if err := os.MkdirAll(moreDir, 0o755); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.WriteFile(filepath.Join(moreDir, "shared.txt"), []byte(content), 0o600); err != nil {
++			t.Fatal(err)
++		}
++	}
++
++	configYAML := func(output string) string {
++		return fmt.Sprintf(`
++cron-expression: "0 5 * * *"
++check-interval: 10080
++listen-port: "127.0.0.1:8199"
++enable-web-ui: true
++output-dir: %q
++sub-store-port: ""
++`, filepath.ToSlash(output))
++	}
++	app := newRuntimeConfigTestApp(t, configYAML(oldOutput))
++	router := newTestRouter()
++	app.registerStaticRoutes(router)
++	shareRouter := newTestRouter()
++	shareRouter.GET(PublicPath+"/*filepath", app.handleFileShare())
++
++	assertDownload := func(target, want string, handler http.Handler) {
++		t.Helper()
++		request := httptest.NewRequest(http.MethodGet, target, nil)
++		response := httptest.NewRecorder()
++		handler.ServeHTTP(response, request)
++		if response.Code != http.StatusOK || response.Body.String() != want {
++			t.Fatalf("download = (%d, %q), want (200, %q)",
++				response.Code, response.Body.String(), want)
++		}
++	}
++	assertDownload("/"+fileName, "old-directory", router)
++	assertDownload("/more/shared.txt", "old-share", shareRouter)
++
++	writeRuntimeConfig(t, app.configPath, configYAML(newOutput))
++	status, err := app.onConfigChange()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if status.State != configStateApplied {
++		t.Fatalf("output-dir reload state = %q, want applied", status.State)
++	}
++	assertDownload("/"+fileName, "new-directory", router)
++	assertDownload("/more/shared.txt", "new-share", shareRouter)
++}
++
++func newTestRouter() *gin.Engine {
++	gin.SetMode(gin.TestMode)
++	return gin.New()
++}
++
++func TestSafeSharePathRejectsTraversalAndPrefixConfusion(t *testing.T) {
++	base := filepath.Join(t.TempDir(), "share")
++	if _, ok := safeSharePath(base, "../../outside.txt"); ok {
++		t.Fatal("parent traversal unexpectedly accepted")
++	}
++	if _, ok := safeSharePath(base, `..\share-evil\outside.txt`); ok {
++		t.Fatal("sibling prefix path unexpectedly accepted")
++	}
++	got, ok := safeSharePath(base, "/nested/file.txt")
++	if !ok || got != filepath.Join(base, "nested", "file.txt") {
++		t.Fatalf("safe path = %q, %v", got, ok)
++	}
++}
+diff --git a/app/server.go b/app/server.go
+index b91c6b6..ea378cc 100644
+--- a/app/server.go
++++ b/app/server.go
+@@ -76,23 +76,16 @@ func (app *App) initHTTPServer() error {
+ 	staticSub, _ := fs.Sub(webui.StaticFS, "static")
+ 	router.StaticFS(StaticPrefix, http.FS(staticSub))
+ 
+-	saver, err := method.NewLocalSaver()
+-	if err != nil {
+-		return fmt.Errorf("获取http监听目录失败: %w", err)
+-	}
+-
+ 	if err := check.SyncSilentSubscriptionArchive(); err != nil {
+ 		slog.Warn("沉默订阅档案初始化失败", "错误", err)
+ 	}
+ 
+ 	app.ensureAPIKey()
+-	app.registerStaticRoutes(router, saver.OutputPath)
++	app.registerStaticRoutes(router)
+ 	// 注册订阅流量信息路由
+ 	app.registerSubscriptionInfoRoute(router)
+ 
+-	if err := app.registerShareRoutes(router, saver.OutputPath); err != nil {
+-		slog.Error("注册分享路由失败", "error", err)
+-	}
++	app.registerShareRoutes(router)
+ 
+ 	// 注册WebUI 路由
+ 	if !config.GlobalConfig.EnableWebUI {
+@@ -140,7 +133,10 @@ func (app *App) initHTTPServer() error {
+ 		}
+ 	}()
+ 
+-	webUIURL := "http://localhost:" + strings.TrimPrefix(listenAddr, ":") + AdminPath
++	webUIURL, err := utils.BuildLoopbackHTTPURL(listenAddr, DefaultPort, AdminPath, "")
++	if err != nil {
++		webUIURL = AdminPath
++	}
+ 
+ 	if config.GlobalConfig.EnableWebUI {
+ 		slog.Info("启用Web控制面板", "path", webUIURL, "api-key", config.GlobalConfig.APIKey)
+@@ -182,14 +178,12 @@ func (app *App) silentLoggerMiddleware() gin.HandlerFunc {
+ // - 公共文件：无需鉴权，直接暴露
+ //
+ // - 受保护文件：需要鉴权中间件
+-func (app *App) registerStaticRoutes(router *gin.Engine, outputPath string) {
+-	rulesDir := outputPath
+-	subDir := filepath.Join(outputPath, "sub")
+-
++func (app *App) registerStaticRoutes(router *gin.Engine) {
+ 	// 公共静态文件映射（无需鉴权），从包级变量读取
+ 	for _, f := range publicStaticFileList {
+-		router.StaticFile(f.Route, filepath.Join(rulesDir, f.File))
+-		router.StaticFile(SubPath+f.Route, filepath.Join(rulesDir, f.File))
++		fileName := f.File
++		router.GET(f.Route, app.serveCurrentOutputFile(fileName))
++		router.GET(SubPath+f.Route, app.serveCurrentOutputFile(fileName))
+ 	}
+ 
+ 	// 受保护静态文件映射（需鉴权）
+@@ -210,40 +204,50 @@ func (app *App) registerStaticRoutes(router *gin.Engine, outputPath string) {
+ 		"/mihomo.yaml":  "mihomo.yaml",  // Mihomo 格式
+ 	}
+ 	for routePath, fileName := range protectedFiles {
+-		// 映射到 outputPath/sub 下的文件
+-		authGroup.StaticFile(routePath, filepath.Join(subDir, fileName))
++		// Resolve output-dir for every request so downloads switch together with
++		// the active saver after a hot reload.
++		authGroup.GET(routePath, app.serveCurrentOutputFile("sub", fileName))
+ 		// 同时提供 /sub 路径访问
+-		authGroup.StaticFile(SubPath+routePath, filepath.Join(subDir, fileName))
++		authGroup.GET(SubPath+routePath, app.serveCurrentOutputFile("sub", fileName))
+ 	}
+ }
+ 
+ // registerShareRoutes 注册分享路由
+-func (app *App) registerShareRoutes(router *gin.Engine, outputPath string) error {
+-	publicShareDir := outputPath
+-	encryptedShareDir := filepath.Join(outputPath, "sub") // 加密分享
+-
++func (app *App) registerShareRoutes(router *gin.Engine) {
+ 	// 1. 加密分享路由 (/sub/...)
+ 	// 匹配 /sub/分享码/文件名
+-	router.GET(SubPath+"/:code/*filepath", app.handleEncryptedShare(encryptedShareDir))
++	router.GET(SubPath+"/:code/*filepath", app.handleEncryptedShare())
+ 	// 匹配 /sub 和 /sub/（处理未输入分享码的情况）
+-	router.GET(SubPath, app.handleEncryptedShare(encryptedShareDir))
+-	router.GET(SubPath+"/", app.handleEncryptedShare(encryptedShareDir))
+-	router.GET(SharePath, app.handleEncryptedShare(encryptedShareDir))
+-	router.GET(SharePath+"/", app.handleEncryptedShare(encryptedShareDir))
++	router.GET(SubPath, app.handleEncryptedShare())
++	router.GET(SubPath+"/", app.handleEncryptedShare())
++	router.GET(SharePath, app.handleEncryptedShare())
++	router.GET(SharePath+"/", app.handleEncryptedShare())
+ 
+ 	// 2. 公开分享路由 (/more/...)
+-	moreDirPath := filepath.Join(publicShareDir, ShareDirName)
+-	if _, err := os.Stat(moreDirPath); os.IsNotExist(err) {
+-		if err := os.MkdirAll(moreDirPath, 0o755); err != nil {
+-			return err
+-		}
+-	}
+-	router.GET(PublicPath+"/*filepath", app.handleFileShare(moreDirPath, false))
++	router.GET(PublicPath+"/*filepath", app.handleFileShare())
+ 
+ 	// 分享索引页：展示所有分享入口
+ 	router.GET(FilesPath, app.handleFilesIndex)
++}
+ 
+-	return nil
++func (app *App) currentOutputPath(parts ...string) (string, error) {
++	saver, err := method.NewLocalSaver()
++	if err != nil {
++		return "", err
++	}
++	allParts := append([]string{saver.OutputPath}, parts...)
++	return filepath.Join(allParts...), nil
++}
++
++func (app *App) serveCurrentOutputFile(parts ...string) gin.HandlerFunc {
++	return func(c *gin.Context) {
++		filePath, err := app.currentOutputPath(parts...)
++		if err != nil {
++			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
++			return
++		}
++		serveFileNoCache(c, filePath)
++	}
+ }
+ 
+ func corsWails(c *gin.Context) {
+@@ -330,20 +334,12 @@ func checkPortFree(listenAddr string) bool {
+ 
+ // normalizeListenAddr 处理监听端口
+ func normalizeListenAddr(s string) string {
+-	s = strings.TrimSpace(s)
+-	if s == "" {
+-		return DefaultPort
+-	}
+-	if n, err := strconv.Atoi(s); err == nil && n > 0 && n <= 65535 {
+-		return ":" + s
+-	}
+-	if host, port, err := net.SplitHostPort(s); err == nil {
+-		if n, err := strconv.Atoi(port); err == nil && n > 0 && n <= 65535 {
+-			return net.JoinHostPort(host, port)
+-		}
++	address, _, err := utils.ParseListenAddress(s, DefaultPort)
++	if err != nil {
++		slog.Error("监听地址无效，使用默认地址", "value", s, "default", DefaultPort, "error", err)
+ 		return DefaultPort
+ 	}
+-	return DefaultPort
++	return address
+ }
+ 
+ // API 处理方法
+diff --git a/app/share_utils.go b/app/share_utils.go
+index af68e56..27d1c61 100644
+--- a/app/share_utils.go
++++ b/app/share_utils.go
+@@ -101,7 +101,7 @@ func readDirFiles(dirPath string) []FileEntry {
+ 		}
+ 		files = append(files, FileEntry{
+ 			Name:    e.Name(),
+-			Size: strconv.FormatFloat(float64(info.Size())/1024, 'f', 1, 64) + " KB",
++			Size:    strconv.FormatFloat(float64(info.Size())/1024, 'f', 1, 64) + " KB",
+ 			ModTime: info.ModTime().Format("01-02 15:04"),
+ 		})
+ 	}
+@@ -116,8 +116,13 @@ func readDirFiles(dirPath string) []FileEntry {
+ //  3. 分享码错误  → 401 显示错误提示
+ //  4. 分享码正确且无子路径 → 200 展示文件列表
+ //  5. 分享码正确有子路径  → 返回文件内容
+-func (app *App) handleEncryptedShare(basePath string) gin.HandlerFunc {
++func (app *App) handleEncryptedShare() gin.HandlerFunc {
+ 	return func(c *gin.Context) {
++		basePath, err := app.currentOutputPath("sub")
++		if err != nil {
++			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
++			return
++		}
+ 		inputCode := c.Param("code")
+ 		relPath := c.Param("filepath")
+ 		serverPassword := config.GlobalConfig.SharePassword
+@@ -186,8 +191,8 @@ func (app *App) handleEncryptedShare(basePath string) gin.HandlerFunc {
+ 		}
+ 
+ 		// ⑤ 验证通过，有子路径 → 防路径穿越后返回文件
+-		absPath := filepath.Join(basePath, filepath.Clean(relPath))
+-		if !strings.HasPrefix(absPath, basePath) {
++		absPath, safe := safeSharePath(basePath, relPath)
++		if !safe {
+ 			c.AbortWithStatus(http.StatusForbidden)
+ 			return
+ 		}
+@@ -210,8 +215,17 @@ func (app *App) handleEncryptedShare(basePath string) gin.HandlerFunc {
+ }
+ 
+ // handleFileShare 处理公开分享 /more/*filepath（无鉴权）
+-func (app *App) handleFileShare(basePath string, _ bool) gin.HandlerFunc {
++func (app *App) handleFileShare() gin.HandlerFunc {
+ 	return func(c *gin.Context) {
++		basePath, err := app.currentOutputPath(ShareDirName)
++		if err != nil {
++			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
++			return
++		}
++		if err := os.MkdirAll(basePath, 0o755); err != nil {
++			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
++			return
++		}
+ 		relPath := c.Param("filepath")
+ 
+ 		// 无子路径 → 显示公开分享提示（不列举文件）
+@@ -231,8 +245,8 @@ func (app *App) handleFileShare(basePath string, _ bool) gin.HandlerFunc {
+ 		}
+ 
+ 		// 防路径穿越
+-		absPath := filepath.Join(basePath, filepath.Clean(relPath))
+-		if !strings.HasPrefix(absPath, basePath) {
++		absPath, safe := safeSharePath(basePath, relPath)
++		if !safe {
+ 			c.AbortWithStatus(http.StatusForbidden)
+ 			return
+ 		}
+@@ -253,6 +267,23 @@ func (app *App) handleFileShare(basePath string, _ bool) gin.HandlerFunc {
+ 	}
+ }
+ 
++func safeSharePath(basePath, requestPath string) (string, bool) {
++	baseAbs, err := filepath.Abs(basePath)
++	if err != nil {
++		return "", false
++	}
++	requestPath = strings.TrimLeft(requestPath, `/\`)
++	candidateAbs, err := filepath.Abs(filepath.Join(baseAbs, filepath.Clean(requestPath)))
++	if err != nil {
++		return "", false
++	}
++	relative, err := filepath.Rel(baseAbs, candidateAbs)
++	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
++		return "", false
++	}
++	return candidateAbs, true
++}
++
+ // handleFilesIndex 渲染文件管理索引页：
+ // 根据 share-password 是否配置动态控制加密分享入口的状态
+ func (app *App) handleFilesIndex(c *gin.Context) {
+diff --git a/app/substore_manager.go b/app/substore_manager.go
+index c077b1d..01626f2 100644
+--- a/app/substore_manager.go
++++ b/app/substore_manager.go
+@@ -37,7 +37,7 @@ type subStoreRequest struct {
+ }
+ 
+ type subStoreRunner func(context.Context, assets.SubStoreRuntimeSpec)
+-type subStoreKiller func() error
++type subStoreKiller func(assets.SubStoreRuntimeSpec) error
+ 
+ // subStoreManager owns the only Sub-Store supervisor goroutine. Config reloads
+ // merely replace the desired request in its one-slot mailbox and return.
+@@ -150,7 +150,7 @@ func (manager *subStoreManager) latestRequest(first subStoreRequest) subStoreReq
+ 	}
+ }
+ 
+-func (manager *subStoreManager) stopActive(cancel context.CancelFunc, done <-chan struct{}) {
++func (manager *subStoreManager) stopActive(spec assets.SubStoreRuntimeSpec, cancel context.CancelFunc, done <-chan struct{}) {
+ 	cancel()
+ 	timer := time.NewTimer(manager.stopTimeout)
+ 	defer timer.Stop()
+@@ -162,7 +162,7 @@ func (manager *subStoreManager) stopActive(cancel context.CancelFunc, done <-cha
+ 		manager.setStatus(func(status *subStoreApplyStatus) {
+ 			status.WaitingReason = "graceful-stop-timeout"
+ 		})
+-		if err := manager.kill(); err != nil {
++		if err := manager.kill(spec); err != nil {
+ 			manager.setStatus(func(status *subStoreApplyStatus) {
+ 				status.LastError = err.Error()
+ 			})
+@@ -191,7 +191,7 @@ func (manager *subStoreManager) loop() {
+ 		select {
+ 		case <-manager.ctx.Done():
+ 			if activeCancel != nil {
+-				manager.stopActive(activeCancel, activeDone)
++				manager.stopActive(activeSpec, activeCancel, activeDone)
+ 			}
+ 			manager.setStatus(func(status *subStoreApplyStatus) {
+ 				status.State = subStoreStateDisabled
+@@ -224,7 +224,7 @@ func (manager *subStoreManager) loop() {
+ 					status.State = subStoreStateReconciling
+ 					status.WaitingReason = "stopping-previous-process"
+ 				})
+-				manager.stopActive(activeCancel, activeDone)
++				manager.stopActive(activeSpec, activeCancel, activeDone)
+ 				activeCancel = nil
+ 				activeDone = nil
+ 			}
+@@ -306,5 +306,7 @@ func (app *App) subStoreSpecLocked(runtimeConfig *config.Config) assets.SubStore
+ 		ProduceCron:        runtimeConfig.SubStoreProduceCron,
+ 		PushService:        runtimeConfig.SubStorePushService,
+ 		MihomoOverwriteURL: runtimeConfig.MihomoOverwriteURL,
++		OutputDir:          runtimeConfig.OutputDir,
++		ConfigDir:          runtimeConfig.ConfigDir,
+ 	}
+ }
+diff --git a/app/substore_manager_test.go b/app/substore_manager_test.go
+index 0422b78..f3fa4c2 100644
+--- a/app/substore_manager_test.go
++++ b/app/substore_manager_test.go
+@@ -39,7 +39,7 @@ func TestSubStoreSubmitReturnsWithoutWaitingForProcessExit(t *testing.T) {
+ 	manager := newSubStoreManager(func(ctx context.Context, _ assets.SubStoreRuntimeSpec) {
+ 		started <- struct{}{}
+ 		<-ctx.Done()
+-	}, func() error { return nil })
++	}, func(assets.SubStoreRuntimeSpec) error { return nil })
+ 	defer closeSubStoreManager(t, manager)
+ 
+ 	manager.Submit(assets.SubStoreRuntimeSpec{Port: ":8299", Path: "/one"}, 1)
+@@ -74,7 +74,7 @@ func TestSubStoreManagerCoalescesRapidChangesAndNeverOverlapsRunners(t *testing.
+ 		mu.Unlock()
+ 		<-ctx.Done()
+ 		active.Add(-1)
+-	}, func() error { return nil })
++	}, func(assets.SubStoreRuntimeSpec) error { return nil })
+ 	defer closeSubStoreManager(t, manager)
+ 
+ 	for version := uint64(1); version <= 10; version++ {
+@@ -106,7 +106,7 @@ func TestSubStoreRuntimeSpecChangesTriggerReconcile(t *testing.T) {
+ 	manager := newSubStoreManager(func(ctx context.Context, spec assets.SubStoreRuntimeSpec) {
+ 		started <- spec
+ 		<-ctx.Done()
+-	}, func() error { return nil })
++	}, func(assets.SubStoreRuntimeSpec) error { return nil })
+ 	defer closeSubStoreManager(t, manager)
+ 
+ 	specs := []assets.SubStoreRuntimeSpec{
+@@ -117,6 +117,7 @@ func TestSubStoreRuntimeSpecChangesTriggerReconcile(t *testing.T) {
+ 		{Port: ":8399", Path: "/two", SyncCron: "1 * * * *", ProduceCron: "2 * * * *"},
+ 		{Port: ":8399", Path: "/two", SyncCron: "1 * * * *", ProduceCron: "2 * * * *", PushService: "push"},
+ 		{Port: ":8399", Path: "/two", SyncCron: "1 * * * *", ProduceCron: "2 * * * *", PushService: "push", MihomoOverwriteURL: "http://127.0.0.1:9090"},
++		{Port: ":8399", Path: "/two", SyncCron: "1 * * * *", ProduceCron: "2 * * * *", PushService: "push", MihomoOverwriteURL: "http://127.0.0.1:9090", OutputDir: "new-output"},
+ 	}
+ 	for index, spec := range specs {
+ 		version := uint64(index + 1)
+@@ -137,7 +138,7 @@ func TestSubStoreManagerUsesKillFallbackAfterStopTimeout(t *testing.T) {
+ 	var killCalls atomic.Int32
+ 	manager := newSubStoreManager(func(_ context.Context, _ assets.SubStoreRuntimeSpec) {
+ 		<-release
+-	}, func() error {
++	}, func(assets.SubStoreRuntimeSpec) error {
+ 		if killCalls.Add(1) == 1 {
+ 			close(release)
+ 		}
+diff --git a/assets/sub_run.go b/assets/sub_run.go
+index 8c5c2a2..7a619fa 100644
+--- a/assets/sub_run.go
++++ b/assets/sub_run.go
+@@ -8,18 +8,19 @@ import (
+ 	"io"
+ 	"io/fs"
+ 	"log/slog"
++	"net"
+ 	"net/url"
+ 	"os"
+ 	"os/exec"
+ 	"path/filepath"
+ 	"runtime"
+-	"strconv"
+ 	"strings"
+ 	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/klauspost/compress/zstd"
+ 	"github.com/shirou/gopsutil/v4/process"
++	"github.com/sinspired/subs-check-pro/v2/config"
+ 	"github.com/sinspired/subs-check-pro/v2/save/method"
+ 	"github.com/sinspired/subs-check-pro/v2/utils"
+ 	"gopkg.in/natefinch/lumberjack.v2"
+@@ -39,6 +40,8 @@ type SubStoreRuntimeSpec struct {
+ 	ProduceCron        string
+ 	PushService        string
+ 	MihomoOverwriteURL string
++	OutputDir          string
++	ConfigDir          string
+ }
+ 
+ type subStorePaths struct {
+@@ -53,8 +56,8 @@ type subStorePaths struct {
+ }
+ 
+ // getSubStorePaths 获取 sub-store 相关路径
+-func getSubStorePaths() (*subStorePaths, error) {
+-	saver, err := method.NewLocalSaver()
++func getSubStorePathsForRuntime(outputDir, configDir string) (*subStorePaths, error) {
++	saver, err := method.NewLocalSaverForRuntime(outputDir, configDir)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -92,22 +95,19 @@ func logStop(port string) {
+ 
+ // RunSubStoreService 运行sub-store服务，支持 ctx，可被外部取消
+ func RunSubStoreService(ctx context.Context, spec SubStoreRuntimeSpec) {
+-	listenPort := strings.TrimPrefix(spec.ListenPort, ":")
+-	subStorePort := strings.TrimPrefix(spec.Port, ":")
+-
+-	if subStorePort == "" {
++	if strings.TrimSpace(spec.Port) == "" {
+ 		IsSubStoreRunning.Store(false)
+ 		return
+ 	}
+ 
+-	// 校验端口合法性（1~65535）
+-	port, err := strconv.Atoi(subStorePort)
+-	if err != nil || port < 1 || port > 65535 {
+-		slog.Error("SubStore 端口不合法，请检查配置", "port", subStorePort)
++	_, listenPort, listenErr := utils.ParseListenAddress(spec.ListenPort, ":8199")
++	_, subStorePort, subStoreErr := utils.ParseListenAddress(spec.Port, "")
++	if subStoreErr != nil {
++		slog.Error("SubStore 端口不合法，请检查配置", "port", spec.Port, "error", subStoreErr)
+ 		return
+ 	}
+ 
+-	if subStorePort == listenPort {
++	if listenErr == nil && subStorePort == listenPort {
+ 		slog.Error("SubStore 服务因端口冲突禁用，请修改端口配置")
+ 		return
+ 	}
+@@ -179,7 +179,7 @@ func killNodeProcess(nodePath string) {
+ }
+ 
+ func startSubStore(ctx context.Context, spec SubStoreRuntimeSpec) error {
+-	paths, err := getSubStorePaths()
++	paths, err := getSubStorePathsForRuntime(spec.OutputDir, spec.ConfigDir)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -251,35 +251,16 @@ func startSubStore(ctx context.Context, spec SubStoreRuntimeSpec) error {
+ 	}
+ 
+ 	// ipv4/ipv6 都支持
+-	subStoreHost := spec.Port
+-	if strings.Contains(subStoreHost, ":") {
+-		hostPort := strings.Split(subStoreHost, ":")
+-
+-		// host可以为空，port不能为空
+-		env := os.Environ()
+-
+-		switch {
+-		case len(hostPort) == 2 && hostPort[1] != "":
+-			// host + port
+-			env = append(env,
+-				"SUB_STORE_BACKEND_API_HOST="+hostPort[0],
+-				"SUB_STORE_BACKEND_API_PORT="+hostPort[1],
+-			)
+-
+-		case len(hostPort) == 1:
+-			// only host, port needs normalization
+-			env = append(env,
+-				"SUB_STORE_BACKEND_API_PORT="+normalizeSubstorePort(subStoreHost),
+-			)
+-
+-		default:
+-			return fmt.Errorf("sub-store-port invalid port format: %s", subStoreHost)
+-		}
+-
+-		cmd.Env = env
+-	} else {
+-		cmd.Env = append(os.Environ(), "SUB_STORE_BACKEND_API_PORT="+normalizeSubstorePort(subStoreHost)) // 设置端口
++	subStoreAddress, subStorePort, err := utils.ParseListenAddress(spec.Port, "")
++	if err != nil {
++		return err
++	}
++	subStoreHost, _, _ := net.SplitHostPort(subStoreAddress)
++	cmd.Env = os.Environ()
++	if subStoreHost != "" {
++		cmd.Env = append(cmd.Env, "SUB_STORE_BACKEND_API_HOST="+subStoreHost)
+ 	}
++	cmd.Env = append(cmd.Env, "SUB_STORE_BACKEND_API_PORT="+subStorePort)
+ 
+ 	// 如果MihomoOverwriteUrl包含本地IP，则移除所有代理环境变量
+ 	if cleanProxyEnv {
+@@ -357,7 +338,6 @@ func startSubStore(ctx context.Context, spec SubStoreRuntimeSpec) error {
+ 		return fmt.Errorf("启动 sub-store 失败: %w", err)
+ 	}
+ 
+-	subStorePort := strings.TrimPrefix(spec.Port, ":")
+ 	slog.Info("Sub-Store已启动", "port", subStorePort, "pid", cmd.Process.Pid, "log", paths.logPath)
+ 	IsSubStoreRunning.Store(true)
+ 
+@@ -392,20 +372,6 @@ func startSubStore(ctx context.Context, spec SubStoreRuntimeSpec) error {
+ 	return nil
+ }
+ 
+-// normalizeSubstorePort 确保端口格式合法
+-func normalizeSubstorePort(s string) string {
+-	const def = "8299"
+-	s = strings.TrimSpace(s)
+-	if s == "" {
+-		return def
+-	}
+-	// 如果是数字且在 1-65535，则返回原始输入
+-	if p, err := strconv.Atoi(s); err == nil && p > 0 && p <= 65535 {
+-		return s
+-	}
+-	return def
+-}
+-
+ // decodeZstdToFile 将嵌入的 zstd 压缩数据解压写入文件
+ // 目前仅供 node 二进制使用（node 体积大，仍以 zstd 压缩嵌入）
+ func decodeZstdToFile(decoder *zstd.Decoder, data []byte, targetPath string, perm os.FileMode, desc string) error {
+@@ -551,7 +517,10 @@ func killProcess(pid int32) error {
+ 
+ // FindNode 查找 Node 进程是否存在
+ func FindNode() (bool, error) {
+-	paths, err := getSubStorePaths()
++	paths, err := getSubStorePathsForRuntime(
++		config.GlobalConfig.OutputDir,
++		config.GlobalConfig.ConfigDir,
++	)
+ 	if err != nil {
+ 		return false, err
+ 	}
+@@ -564,7 +533,16 @@ func FindNode() (bool, error) {
+ 
+ // KillNode 杀掉 Node 进程
+ func KillNode() error {
+-	paths, err := getSubStorePaths()
++	return KillNodeForSpec(SubStoreRuntimeSpec{
++		OutputDir: config.GlobalConfig.OutputDir,
++		ConfigDir: config.GlobalConfig.ConfigDir,
++	})
++}
++
++// KillNodeForSpec locates the fallback process in the directory used by the
++// active immutable runtime spec, even if a newer config points elsewhere.
++func KillNodeForSpec(spec SubStoreRuntimeSpec) error {
++	paths, err := getSubStorePathsForRuntime(spec.OutputDir, spec.ConfigDir)
+ 	if err != nil {
+ 		return err
+ 	}
+diff --git a/proxy/proxies.go b/proxy/proxies.go
+index 1bfa686..06dc585 100644
+--- a/proxy/proxies.go
++++ b/proxy/proxies.go
+@@ -7,7 +7,6 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"log/slog"
+-	"net"
+ 	"net/http"
+ 	"net/url"
+ 	"os"
+@@ -699,22 +698,22 @@ func processSubscription(
+ // normalizeListenPort accepts the port-only values used by upstream as well as
+ // host-qualified listen addresses used to restrict the WebUI to loopback.
+ func normalizeListenPort(listenAddress string) string {
+-	listenAddress = strings.TrimSpace(listenAddress)
+-	if _, port, err := net.SplitHostPort(listenAddress); err == nil {
+-		return port
++	_, port, err := utils.ParseListenAddress(listenAddress, "")
++	if err != nil {
++		return ""
+ 	}
+-	return strings.TrimPrefix(listenAddress, ":")
++	return port
+ }
+ 
+ // localSubscriptionURL always connects through IPv4 loopback. The configured
+ // host controls where the WebUI listens; only its numeric port belongs in this
+ // internal URL.
+ func localSubscriptionURL(listenAddress, filename string) string {
+-	return (&url.URL{
+-		Scheme: "http",
+-		Host:   net.JoinHostPort("127.0.0.1", normalizeListenPort(listenAddress)),
+-		Path:   "/" + strings.TrimPrefix(filename, "/"),
+-	}).String()
++	internalURL, err := utils.BuildLoopbackHTTPURL(listenAddress, ":8199", filename, "")
++	if err != nil {
++		return ""
++	}
++	return internalURL
+ }
+ 
+ // identifyLocalSubType 识别本地订阅源类型
+diff --git a/save/method/local.go b/save/method/local.go
+index 6b329f3..20d69ae 100644
+--- a/save/method/local.go
++++ b/save/method/local.go
+@@ -24,6 +24,13 @@ type LocalSaver struct {
+ 
+ // NewLocalSaver 创建新的本地保存器
+ func NewLocalSaver() (*LocalSaver, error) {
++	return NewLocalSaverForRuntime(config.GlobalConfig.OutputDir, config.GlobalConfig.ConfigDir)
++}
++
++// NewLocalSaverForRuntime resolves a path from one immutable runtime
++// configuration. Long-running child services use this instead of rereading
++// GlobalConfig while they start.
++func NewLocalSaverForRuntime(outputDir, configDir string) (*LocalSaver, error) {
+ 	basePath := utils.GetExecutablePath()
+ 	if basePath == "" {
+ 		return nil, fmt.Errorf("获取可执行文件路径失败")
+@@ -33,13 +40,13 @@ func NewLocalSaver() (*LocalSaver, error) {
+ 	defaultConfigDir := filepath.Join(basePath, "config")
+ 
+ 	switch {
+-	case config.GlobalConfig.OutputDir != "":
++	case outputDir != "":
+ 		// 用户在配置文件中显式设置了输出目录，直接使用
+-		outputPath = config.GlobalConfig.OutputDir
+-	case config.GlobalConfig.ConfigDir != "" && config.GlobalConfig.ConfigDir != defaultConfigDir:
++		outputPath = outputDir
++	case configDir != "" && configDir != defaultConfigDir:
+ 		// 用户主动选择了非默认位置的配置文件，输出目录跟随配置文件所在目录。
+ 		// 默认位置（<exe>/config/）保持原有 <exe>/output/ 行为，不破坏现有部署。
+-		outputPath = filepath.Join(config.GlobalConfig.ConfigDir, outputDirName)
++		outputPath = filepath.Join(configDir, outputDirName)
+ 	default:
+ 		outputPath = filepath.Join(basePath, outputDirName)
+ 	}
+@@ -109,4 +116,4 @@ func (ls *LocalSaver) validateInput(yamlData []byte, filename string) error {
+ 	}
+ 
+ 	return nil
+-}
+\ No newline at end of file
++}
+diff --git a/save/method/stats.go b/save/method/stats.go
+index b6d4b54..2fa569b 100644
+--- a/save/method/stats.go
++++ b/save/method/stats.go
+@@ -5,9 +5,6 @@ import (
+ 	"log/slog"
+ 	"os"
+ 	"path/filepath"
+-
+-	"github.com/sinspired/subs-check-pro/v2/config"
+-	"github.com/sinspired/subs-check-pro/v2/utils"
+ )
+ 
+ // StatsSaver 处理本地文件保存的结构体
+@@ -18,30 +15,14 @@ type StatsSaver struct {
+ 
+ // NewStatsSaver 创建新的本地保存器
+ func NewStatsSaver() (*StatsSaver, error) {
+-	basePath := utils.GetExecutablePath()
+-	if basePath == "" {
+-		return nil, fmt.Errorf("获取可执行文件路径失败")
+-	}
+-
+-	
+-	var outputPath string
+-	defaultConfigDir := filepath.Join(basePath, "config")
+-
+-	switch {
+-	case config.GlobalConfig.OutputDir != "":
+-		// 用户在配置文件中显式设置了输出目录，直接使用
+-		outputPath = config.GlobalConfig.OutputDir
+-	case config.GlobalConfig.ConfigDir != "" && config.GlobalConfig.ConfigDir != defaultConfigDir:
+-		// 用户主动选择了非默认位置的配置文件，输出目录跟随配置文件所在目录。
+-		// 默认位置（<exe>/config/）保持原有 <exe>/output/ 行为，不破坏现有部署。
+-		outputPath = filepath.Join(config.GlobalConfig.ConfigDir, outputDirName)
+-	default:
+-		outputPath = filepath.Join(basePath, outputDirName)
++	localSaver, err := NewLocalSaver()
++	if err != nil {
++		return nil, err
+ 	}
+ 
+-	statsPath := filepath.Join(outputPath, "stats")
++	statsPath := filepath.Join(localSaver.OutputPath, "stats")
+ 	return &StatsSaver{
+-		BasePath:  basePath,
++		BasePath:  localSaver.BasePath,
+ 		StatsPath: statsPath,
+ 	}, nil
+ }
+diff --git a/utils/listen_address.go b/utils/listen_address.go
+new file mode 100644
+index 0000000..2215744
+--- /dev/null
++++ b/utils/listen_address.go
+@@ -0,0 +1,56 @@
++package utils
++
++import (
++	"fmt"
++	"net"
++	"net/url"
++	"strconv"
++	"strings"
++)
++
++// ParseListenAddress accepts a numeric port, :port, host:port, or bracketed
++// IPv6 host:port and returns one canonical bind address plus its numeric port.
++func ParseListenAddress(value, defaultAddress string) (address, port string, err error) {
++	value = strings.TrimSpace(value)
++	if value == "" {
++		value = strings.TrimSpace(defaultAddress)
++	}
++	if value == "" {
++		return "", "", fmt.Errorf("listen address is empty")
++	}
++
++	if number, parseErr := strconv.Atoi(value); parseErr == nil {
++		if number < 1 || number > 65535 {
++			return "", "", fmt.Errorf("port is out of range: %s", value)
++		}
++		port = strconv.Itoa(number)
++		return ":" + port, port, nil
++	}
++
++	host, port, splitErr := net.SplitHostPort(value)
++	if splitErr != nil {
++		return "", "", fmt.Errorf("invalid listen address %q: %w", value, splitErr)
++	}
++	number, parseErr := strconv.Atoi(port)
++	if parseErr != nil || number < 1 || number > 65535 {
++		return "", "", fmt.Errorf("port is out of range: %s", port)
++	}
++	port = strconv.Itoa(number)
++	return net.JoinHostPort(host, port), port, nil
++}
++
++// BuildLoopbackHTTPURL uses only the numeric port from a bind address. Internal
++// clients always connect over IPv4 loopback even when the server binds a
++// specific hostname, wildcard address, or IPv6 address.
++func BuildLoopbackHTTPURL(listenAddress, defaultAddress, requestPath, fragment string) (string, error) {
++	_, port, err := ParseListenAddress(listenAddress, defaultAddress)
++	if err != nil {
++		return "", err
++	}
++	return (&url.URL{
++		Scheme:   "http",
++		Host:     net.JoinHostPort("127.0.0.1", port),
++		Path:     "/" + strings.TrimPrefix(requestPath, "/"),
++		Fragment: fragment,
++	}).String(), nil
++}
+diff --git a/utils/listen_address_test.go b/utils/listen_address_test.go
+new file mode 100644
+index 0000000..276349c
+--- /dev/null
++++ b/utils/listen_address_test.go
+@@ -0,0 +1,49 @@
++package utils
++
++import "testing"
++
++func TestParseListenAddressSupportedForms(t *testing.T) {
++	tests := []struct {
++		input       string
++		wantAddress string
++		wantPort    string
++	}{
++		{input: "8199", wantAddress: ":8199", wantPort: "8199"},
++		{input: ":8199", wantAddress: ":8199", wantPort: "8199"},
++		{input: "127.0.0.1:8199", wantAddress: "127.0.0.1:8199", wantPort: "8199"},
++		{input: "[::1]:8199", wantAddress: "[::1]:8199", wantPort: "8199"},
++	}
++	for _, test := range tests {
++		t.Run(test.input, func(t *testing.T) {
++			address, port, err := ParseListenAddress(test.input, ":8199")
++			if err != nil {
++				t.Fatal(err)
++			}
++			if address != test.wantAddress || port != test.wantPort {
++				t.Fatalf("ParseListenAddress(%q) = %q, %q; want %q, %q",
++					test.input, address, port, test.wantAddress, test.wantPort)
++			}
++		})
++	}
++}
++
++func TestBuildLoopbackHTTPURLNeverDuplicatesConfiguredHost(t *testing.T) {
++	for _, listenAddress := range []string{"8199", ":8199", "127.0.0.1:8199", "[::1]:8199"} {
++		got, err := BuildLoopbackHTTPURL(listenAddress, ":8199", "/api/subinfo", "noCache")
++		if err != nil {
++			t.Fatal(err)
++		}
++		const want = "http://127.0.0.1:8199/api/subinfo#noCache"
++		if got != want {
++			t.Fatalf("BuildLoopbackHTTPURL(%q) = %q, want %q", listenAddress, got, want)
++		}
++	}
++}
++
++func TestParseListenAddressRejectsInvalidValues(t *testing.T) {
++	for _, input := range []string{"0", "65536", "127.0.0.1", "127.0.0.1:bad", "::1:8199"} {
++		if _, _, err := ParseListenAddress(input, ""); err == nil {
++			t.Fatalf("ParseListenAddress(%q) unexpectedly succeeded", input)
++		}
++	}
++}
+diff --git a/utils/substore.go b/utils/substore.go
+index d184d71..8d4f4ca 100644
+--- a/utils/substore.go
++++ b/utils/substore.go
+@@ -825,23 +825,28 @@ func UpdateSubStore(yamlData []byte) {
+ 		time.Sleep(time.Second * 1)
+ 	}
+ 
+-	// 构建订阅流量信息 URL
+-	listenPort := strings.TrimSpace(config.GlobalConfig.ListenPort)
+-	if listenPort == "" {
+-		listenPort = "8199"
+-	}
+-	// 去掉可能存在的前导冒号，统一拼接
+-	listenPort = strings.TrimPrefix(listenPort, ":")
+-	SubUserInfoURL = fmt.Sprintf("http://127.0.0.1:%s%s#noCache", listenPort, SubInfoPath)
+-
+-	// 规范化 SubStorePort，设置 BaseURL
+-	config.GlobalConfig.SubStorePort = formatPort(config.GlobalConfig.SubStorePort)
+-	BaseURL = fmt.Sprintf("http://127.0.0.1%s", config.GlobalConfig.SubStorePort)
+-	if p := config.GlobalConfig.SubStorePath; p != "" {
+-		if !strings.HasPrefix(p, "/") {
+-			config.GlobalConfig.SubStorePath = "/" + p
+-		}
+-		BaseURL += config.GlobalConfig.SubStorePath
++	// Internal URLs are built from the parsed numeric port only. A configured
++	// host-qualified bind address must never be concatenated as if it were a port.
++	var err error
++	SubUserInfoURL, err = BuildLoopbackHTTPURL(
++		config.GlobalConfig.ListenPort,
++		":8199",
++		SubInfoPath,
++		"noCache",
++	)
++	if err != nil {
++		slog.Error("构建订阅流量信息 URL 失败", "error", err)
++		return
++	}
++	BaseURL, err = BuildLoopbackHTTPURL(
++		config.GlobalConfig.SubStorePort,
++		"",
++		config.GlobalConfig.SubStorePath,
++		"",
++	)
++	if err != nil {
++		slog.Error("构建 Sub-Store URL 失败", "error", err)
++		return
+ 	}
+ 
+ 	// --- sub ---
+@@ -885,14 +890,3 @@ func processSingboxFile(sbc *config.SingBoxConfig, defaultJS, defaultJSON, versi
+ 		slog.Warn("sub-store 订阅更新失败", "name", f.Name, "error", err)
+ 	}
+ }
+-
+-// 工具函数
+-
+-// formatPort 统一端口格式为 ":PORT"，兼容用户输入 IP:PORT 的情况
+-func formatPort(port string) string {
+-	if strings.Contains(port, ":") {
+-		parts := strings.Split(port, ":")
+-		return ":" + parts[len(parts)-1]
+-	}
+-	return ":" + port
+-}
