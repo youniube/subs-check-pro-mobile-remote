@@ -1,0 +1,497 @@
+diff --git a/app/server.go b/app/server.go
+index a582e2e..1f23cb0 100644
+--- a/app/server.go
++++ b/app/server.go
+@@ -91,6 +91,10 @@ func (app *App) initHTTPServer() error {
+ 		return fmt.Errorf("获取http监听目录失败: %w", err)
+ 	}
+ 
++	if err := check.SyncSilentSubscriptionArchive(); err != nil {
++		slog.Warn("沉默订阅档案初始化失败", "错误", err)
++	}
++
+ 	app.ensureAPIKey()
+ 	app.registerStaticRoutes(router, saver.OutputPath)
+ 	// 注册订阅流量信息路由
+@@ -311,6 +315,35 @@ func (app *App) updateConfig(c *gin.Context) {
+ 		c.JSON(http.StatusBadRequest, gin.H{"error": "YAML格式错误: " + err.Error()})
+ 		return
+ 	}
++
++	var nextConfig struct {
++		SubURLs []string `yaml:"sub-urls"`
++	}
++	if err := yaml.Unmarshal([]byte(req.Content), &nextConfig); err != nil {
++		c.JSON(http.StatusBadRequest, gin.H{"error": "订阅配置格式错误: " + err.Error()})
++		return
++	}
++	var currentConfig struct {
++		SubURLs []string `yaml:"sub-urls"`
++	}
++	if currentData, err := os.ReadFile(app.configPath); err == nil {
++		if err := yaml.Unmarshal(currentData, &currentConfig); err != nil {
++			c.JSON(http.StatusInternalServerError, gin.H{"error": "现有订阅配置读取失败: " + err.Error()})
++			return
++		}
++	}
++	newSubURLs := check.NewSubscriptionURLs(currentConfig.SubURLs, nextConfig.SubURLs)
++	archivedMatches, err := check.FindArchivedSilentSubscriptions(newSubURLs)
++	if err != nil {
++		c.JSON(http.StatusInternalServerError, gin.H{"error": "沉默订阅档案读取失败: " + err.Error()})
++		return
++	}
++	if len(archivedMatches) > 0 {
++		c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf(
++			"发现 %d 条新增订阅已在沉默订阅档案中（曾连续至少 3 次完整检测无可用节点），为避免重复测速，本次配置未保存。如确需重测，请先从 silent-subscriptions.yaml 删除对应记录。",
++			len(archivedMatches))})
++		return
++	}
+ 	if err := os.WriteFile(app.configPath, []byte(req.Content), 0o644); err != nil {
+ 		c.JSON(http.StatusInternalServerError, gin.H{"error": "保存配置文件失败" + err.Error()})
+ 		return
+diff --git a/check/subscription_history.go b/check/subscription_history.go
+index 0c5d7ad..3c5da08 100644
+--- a/check/subscription_history.go
++++ b/check/subscription_history.go
+@@ -17,8 +17,9 @@ import (
+ )
+ 
+ const (
+-	subscriptionHealthHistoryFilename = "subs-health-history.yaml"
+-	subscriptionDeleteThreshold       = 3
++	subscriptionHealthHistoryFilename  = "subs-health-history.yaml"
++	silentSubscriptionArchiveFilename = "silent-subscriptions.yaml"
++	subscriptionDeleteThreshold        = 3
+ )
+ 
+ type subscriptionHealthHistory struct {
+@@ -46,6 +47,24 @@ type subscriptionRunResult struct {
+ 	Total   int
+ }
+ 
++type silentSubscriptionArchive struct {
++	Version       int                                        `yaml:"version"`
++	UpdatedAt     string                                     `yaml:"updated_at,omitempty"`
++	Threshold     int                                        `yaml:"consecutive_silent_threshold"`
++	Subscriptions map[string]silentSubscriptionArchiveRecord `yaml:"subscriptions"`
++}
++
++type silentSubscriptionArchiveRecord struct {
++	ArchivedAt        string `yaml:"archived_at"`
++	LastCheckedAt     string `yaml:"last_checked_at,omitempty"`
++	LastSilentAt      string `yaml:"last_silent_at,omitempty"`
++	ConsecutiveSilent int    `yaml:"consecutive_silent"`
++	LastTotal         int    `yaml:"last_total"`
++	Reason            string `yaml:"reason"`
++}
++
++const silentSubscriptionArchiveReason = "连续至少 3 次完整检测无可用节点"
++
+ var (
+ 	currentSubscriptionHealthHistory = newSubscriptionHealthHistory()
+ 	currentSubscriptionRunCounted     bool
+@@ -61,6 +80,14 @@ func newSubscriptionHealthHistory() *subscriptionHealthHistory {
+ 	}
+ }
+ 
++func newSilentSubscriptionArchive() *silentSubscriptionArchive {
++	return &silentSubscriptionArchive{
++		Version:       1,
++		Threshold:     subscriptionDeleteThreshold,
++		Subscriptions: make(map[string]silentSubscriptionArchiveRecord),
++	}
++}
++
+ func subscriptionHistoryRunComplete() bool {
+ 	return !ForceClose.Load() && !Successlimited.Load()
+ }
+@@ -108,6 +135,9 @@ func updateSubscriptionHealthHistory(sortedURLs []string) {
+ 	if err := method.SaveToStats(data, subscriptionHealthHistoryFilename, "订阅健康历史已更新"); err != nil {
+ 		slog.Warn("订阅健康历史保存失败", "错误", err)
+ 	}
++	if err := syncSilentSubscriptionArchive(history); err != nil {
++		slog.Warn("沉默订阅档案保存失败", "错误", err)
++	}
+ }
+ 
+ func loadSubscriptionHealthHistory() (*subscriptionHealthHistory, error) {
+@@ -205,6 +235,168 @@ func subscriptionDeleteSuggested(record subscriptionHealthRecord) bool {
+ 	return record.LastStatus == "silent" && record.ConsecutiveSilent >= subscriptionDeleteThreshold
+ }
+ 
++// SyncSilentSubscriptionArchive imports all existing delete suggestions into a
++// dedicated, persistent archive. It is called at startup so an existing health
++// history is immediately available for duplicate checks without another test.
++func SyncSilentSubscriptionArchive() error {
++	history, err := loadSubscriptionHealthHistory()
++	if err != nil {
++		return err
++	}
++	return syncSilentSubscriptionArchive(history)
++}
++
++func syncSilentSubscriptionArchive(history *subscriptionHealthHistory) error {
++	archive, err := loadSilentSubscriptionArchive()
++	if err != nil {
++		return err
++	}
++	mergeSilentSubscriptionArchive(archive, history)
++
++	data, err := yaml.Marshal(archive)
++	if err != nil {
++		return fmt.Errorf("编码沉默订阅档案: %w", err)
++	}
++	if err := method.SaveToStats(data, silentSubscriptionArchiveFilename, "沉默订阅档案已更新"); err != nil {
++		return err
++	}
++	return nil
++}
++
++func loadSilentSubscriptionArchive() (*silentSubscriptionArchive, error) {
++	saver, err := method.NewStatsSaver()
++	if err != nil {
++		return nil, err
++	}
++	data, err := os.ReadFile(filepath.Join(saver.StatsPath, silentSubscriptionArchiveFilename))
++	if os.IsNotExist(err) {
++		return newSilentSubscriptionArchive(), nil
++	}
++	if err != nil {
++		return nil, err
++	}
++
++	archive := newSilentSubscriptionArchive()
++	if len(strings.TrimSpace(string(data))) == 0 {
++		return archive, nil
++	}
++	if err := yaml.Unmarshal(data, archive); err != nil {
++		return nil, err
++	}
++	if archive.Subscriptions == nil {
++		archive.Subscriptions = make(map[string]silentSubscriptionArchiveRecord)
++	}
++	if archive.Version == 0 {
++		archive.Version = 1
++	}
++	if archive.Threshold == 0 {
++		archive.Threshold = subscriptionDeleteThreshold
++	}
++	return archive, nil
++}
++
++func mergeSilentSubscriptionArchive(archive *silentSubscriptionArchive, history *subscriptionHealthHistory) {
++	if archive.Subscriptions == nil {
++		archive.Subscriptions = make(map[string]silentSubscriptionArchiveRecord)
++	}
++	archive.Version = 1
++	archive.Threshold = subscriptionDeleteThreshold
++	if history == nil {
++		return
++	}
++
++	changed := false
++	for subURL, health := range history.Subscriptions {
++		if !subscriptionDeleteSuggested(health) {
++			continue
++		}
++		record, exists := archive.Subscriptions[subURL]
++		if !exists || record.ArchivedAt == "" {
++			record.ArchivedAt = health.LastCheckedAt
++		}
++		record.LastCheckedAt = health.LastCheckedAt
++		record.LastSilentAt = health.LastSilentAt
++		record.ConsecutiveSilent = health.ConsecutiveSilent
++		record.LastTotal = health.LastTotal
++		record.Reason = silentSubscriptionArchiveReason
++		archive.Subscriptions[subURL] = record
++		changed = true
++	}
++	if changed {
++		archive.UpdatedAt = history.UpdatedAt
++		if archive.UpdatedAt == "" {
++			archive.UpdatedAt = time.Now().Format(time.RFC3339)
++		}
++	}
++}
++
++func canonicalSubscriptionURL(raw string) string {
++	value := strings.TrimSpace(raw)
++	if marker := strings.Index(value, "#"); marker >= 0 {
++		value = value[:marker]
++	}
++	return strings.TrimSpace(value)
++}
++
++// NewSubscriptionURLs returns only links newly introduced by a config update.
++// Remarks after # are ignored so changing a display tag is not treated as a
++// new subscription.
++func NewSubscriptionURLs(previous, next []string) []string {
++	existing := make(map[string]struct{}, len(previous))
++	for _, raw := range previous {
++		if key := canonicalSubscriptionURL(raw); key != "" {
++			existing[key] = struct{}{}
++		}
++	}
++
++	seen := make(map[string]struct{}, len(next))
++	var added []string
++	for _, raw := range next {
++		key := canonicalSubscriptionURL(raw)
++		if key == "" {
++			continue
++		}
++		if _, ok := existing[key]; ok {
++			continue
++		}
++		if _, ok := seen[key]; ok {
++			continue
++		}
++		seen[key] = struct{}{}
++		added = append(added, raw)
++	}
++	return added
++}
++
++func matchArchivedSilentSubscriptions(archive *silentSubscriptionArchive, urls []string) []string {
++	archived := make(map[string]struct{}, len(archive.Subscriptions))
++	for raw := range archive.Subscriptions {
++		if key := canonicalSubscriptionURL(raw); key != "" {
++			archived[key] = struct{}{}
++		}
++	}
++	var matches []string
++	for _, raw := range urls {
++		if _, ok := archived[canonicalSubscriptionURL(raw)]; ok {
++			matches = append(matches, raw)
++		}
++	}
++	return matches
++}
++
++// FindArchivedSilentSubscriptions checks prospective new links against the
++// persistent low-quality archive used by the configuration API.
++func FindArchivedSilentSubscriptions(urls []string) ([]string, error) {
++	if len(urls) == 0 {
++		return nil, nil
++	}
++	archive, err := loadSilentSubscriptionArchive()
++	if err != nil {
++		return nil, err
++	}
++	return matchArchivedSilentSubscriptions(archive, urls), nil
++}
++
+ func appendSubscriptionHealthSummary(sb *strings.Builder, sortedURLs []string) {
+ 	suggested := 0
+ 	for _, subURL := range sortedURLs {
+diff --git a/check/subscription_history_test.go b/check/subscription_history_test.go
+index e2f92fd..eb7f1d8 100644
+--- a/check/subscription_history_test.go
++++ b/check/subscription_history_test.go
+@@ -73,3 +73,69 @@ func TestSubscriptionHealthHistoryDistinguishesZeroTotal(t *testing.T) {
+ 		t.Fatal("all-failed subscription lost its 0/N state")
+ 	}
+ }
++
++func TestSilentSubscriptionArchiveKeepsOnlyDeleteSuggestions(t *testing.T) {
++	history := newSubscriptionHealthHistory()
++	history.UpdatedAt = "2026-07-25T10:00:00+08:00"
++	history.Subscriptions["https://bad.example/sub"] = subscriptionHealthRecord{
++		ConsecutiveSilent: 3,
++		LastStatus:        "silent",
++		LastCheckedAt:     history.UpdatedAt,
++		LastSilentAt:      history.UpdatedAt,
++		LastTotal:         12,
++	}
++	history.Subscriptions["https://temporary.example/sub"] = subscriptionHealthRecord{
++		ConsecutiveSilent: 1,
++		LastStatus:        "silent",
++	}
++	history.Subscriptions["https://active.example/sub"] = subscriptionHealthRecord{
++		ConsecutiveSilent: 0,
++		LastStatus:        "active",
++	}
++
++	archive := newSilentSubscriptionArchive()
++	mergeSilentSubscriptionArchive(archive, history)
++
++	if len(archive.Subscriptions) != 1 {
++		t.Fatalf("archive size = %d, want 1", len(archive.Subscriptions))
++	}
++	record, ok := archive.Subscriptions["https://bad.example/sub"]
++	if !ok {
++		t.Fatal("delete-suggested subscription was not archived")
++	}
++	if record.ConsecutiveSilent != 3 || record.LastTotal != 12 {
++		t.Fatalf("archive record lost health details: %+v", record)
++	}
++	if record.ArchivedAt != history.UpdatedAt {
++		t.Fatalf("archive time = %q", record.ArchivedAt)
++	}
++}
++
++func TestNewSubscriptionURLsIgnoresExistingRemarks(t *testing.T) {
++	got := NewSubscriptionURLs(
++		[]string{"https://existing.example/sub#旧备注"},
++		[]string{
++			"https://existing.example/sub#新备注",
++			"https://new.example/sub#新链接",
++			"https://new.example/sub#重复备注",
++		},
++	)
++	if len(got) != 1 || got[0] != "https://new.example/sub#新链接" {
++		t.Fatalf("new subscriptions = %#v", got)
++	}
++}
++
++func TestArchivedSilentSubscriptionMatchesWithoutRemark(t *testing.T) {
++	archive := newSilentSubscriptionArchive()
++	archive.Subscriptions["https://bad.example/sub#旧备注"] = silentSubscriptionArchiveRecord{
++		ArchivedAt: "2026-07-25T10:00:00+08:00",
++	}
++
++	matches := matchArchivedSilentSubscriptions(archive, []string{
++		"https://good.example/sub",
++		"https://bad.example/sub#换个备注",
++	})
++	if len(matches) != 1 || matches[0] != "https://bad.example/sub#换个备注" {
++		t.Fatalf("archive matches = %#v", matches)
++	}
++}
+diff --git a/proxy/proxies.go b/proxy/proxies.go
+index 968f540..83f40d1 100644
+--- a/proxy/proxies.go
++++ b/proxy/proxies.go
+@@ -341,8 +341,16 @@ func resolveSubUrls() ([]string, int, int, int) {
+ 					logFatal(err, subURLRemote)
+ 				}
+ 			} else {
+-				remoteNum += len(remote)
+-				urls = append(urls, remote...)
++				filtered, skipped, archiveErr := filterArchivedSilentSubscriptions(remote)
++				if archiveErr != nil {
++					slog.Warn("沉默订阅档案读取失败，本次不跳过远程清单链接", "错误", archiveErr)
++					filtered = remote
++				}
++				if skipped > 0 {
++					slog.Info("远程清单已跳过沉默订阅", "数量", skipped)
++				}
++				remoteNum += len(filtered)
++				urls = append(urls, filtered...)
+ 			}
+ 		}
+ 	} else {
+@@ -405,6 +413,71 @@ func resolveSubUrls() ([]string, int, int, int) {
+ 	return out, localNum, remoteNum, historyNum
+ }
+ 
++type silentSubscriptionArchiveIndex struct {
++	Subscriptions map[string]any `yaml:"subscriptions"`
++}
++
++func canonicalArchivedSubscriptionURL(raw string) string {
++	value := strings.TrimSpace(raw)
++	if marker := strings.Index(value, "#"); marker >= 0 {
++		value = value[:marker]
++	}
++	return strings.TrimSpace(value)
++}
++
++func filterArchivedSubscriptionURLs(urls []string, archived map[string]any) ([]string, int) {
++	if len(urls) == 0 || len(archived) == 0 {
++		return urls, 0
++	}
++
++	keys := make(map[string]struct{}, len(archived))
++	for raw := range archived {
++		if key := canonicalArchivedSubscriptionURL(raw); key != "" {
++			keys[key] = struct{}{}
++		}
++	}
++
++	filtered := make([]string, 0, len(urls))
++	skipped := 0
++	for _, raw := range urls {
++		key := canonicalArchivedSubscriptionURL(raw)
++		if _, exists := keys[key]; exists {
++			skipped++
++			continue
++		}
++		filtered = append(filtered, raw)
++	}
++	return filtered, skipped
++}
++
++func filterArchivedSilentSubscriptions(urls []string) ([]string, int, error) {
++	if len(urls) == 0 {
++		return urls, 0, nil
++	}
++
++	saver, err := method.NewStatsSaver()
++	if err != nil {
++		return urls, 0, err
++	}
++	data, err := os.ReadFile(filepath.Join(saver.StatsPath, "silent-subscriptions.yaml"))
++	if os.IsNotExist(err) {
++		return urls, 0, nil
++	}
++	if err != nil {
++		return urls, 0, err
++	}
++	if len(strings.TrimSpace(string(data))) == 0 {
++		return urls, 0, nil
++	}
++
++	var archive silentSubscriptionArchiveIndex
++	if err := yaml.Unmarshal(data, &archive); err != nil {
++		return urls, 0, err
++	}
++	filtered, skipped := filterArchivedSubscriptionURLs(urls, archive.Subscriptions)
++	return filtered, skipped, nil
++}
++
+ // fetchRemoteSubUrls 从远程地址读取订阅URL清单
+ func fetchRemoteSubUrls(listURL string) ([]string, error) {
+ 	if listURL == "" {
+diff --git a/proxy/proxies_test.go b/proxy/proxies_test.go
+index 2b99f79..56c18ac 100644
+--- a/proxy/proxies_test.go
++++ b/proxy/proxies_test.go
+@@ -41,3 +41,37 @@ func TestClearFetchCachePreservesSubscriptionStats(t *testing.T) {
+ 		t.Fatalf("fetch cache cleanup changed subscription stats: %+v", got)
+ 	}
+ }
++
++func TestFilterArchivedSubscriptionURLsAfterRemoteExpansion(t *testing.T) {
++	archived := map[string]any{
++		"https://bad.example/sub#旧备注": map[string]any{
++			"consecutive_silent": 5,
++		},
++	}
++	remote := []string{
++		"https://good.example/one",
++		"https://bad.example/sub#远程清单新备注",
++		"https://good.example/two",
++	}
++
++	filtered, skipped := filterArchivedSubscriptionURLs(remote, archived)
++
++	if skipped != 1 {
++		t.Fatalf("skipped = %d, want 1", skipped)
++	}
++	if len(filtered) != 2 {
++		t.Fatalf("filtered subscriptions = %#v", filtered)
++	}
++	if filtered[0] != "https://good.example/one" || filtered[1] != "https://good.example/two" {
++		t.Fatalf("remaining order changed: %#v", filtered)
++	}
++}
++
++func TestFilterArchivedSubscriptionURLsKeepsChangedQuery(t *testing.T) {
++	archived := map[string]any{"https://example.com/sub?token=old": nil}
++	urls := []string{"https://example.com/sub?token=new"}
++	filtered, skipped := filterArchivedSubscriptionURLs(urls, archived)
++	if skipped != 0 || len(filtered) != 1 {
++		t.Fatalf("rotated query should remain testable: skipped=%d filtered=%#v", skipped, filtered)
++	}
++}

@@ -1,0 +1,810 @@
+diff --git a/app/app.go b/app/app.go
+index 69a9b25..39a56a1 100644
+--- a/app/app.go
++++ b/app/app.go
+@@ -60,6 +60,9 @@ type App struct {
+ 	startupConfig         *config.Config
+ 	subStoreManager       *subStoreManager
+ 	subStoreGeneratedPath string
++	authMu                sync.RWMutex
++	previousAPIKey        string
++	previousAPIKeyExpires time.Time
+ 	// updateCron 版本更新定时任务调度器，独立存储以便 SetupUpdateTasks 重调时先停止旧实例，
+ 	// 避免每次配置变更触发重建时 goroutine 持续累积。
+ 	updateCron    *cron.Cron
+@@ -601,6 +604,16 @@ func isDocker() bool {
+ // 每次调用前先停止上一个 updateCron 实例，防止重复调用（如配置变更触发）时
+ // goroutine 无限累积，最终耗尽文件描述符。
+ func (app *App) SetupUpdateTasks() {
++	app.configureUpdateTasks(true)
++}
++
++// ReconfigureUpdateTasks only replaces the cron scheduler. Saving config must
++// never synchronously perform the startup update check or restart flow.
++func (app *App) ReconfigureUpdateTasks() {
++	app.configureUpdateTasks(false)
++}
++
++func (app *App) configureUpdateTasks(runStartupCheck bool) {
+ 	// 停止旧的版本更新定时任务（避免每次配置变更都新增一个永不停止的 cron goroutine）
+ 	if app.updateCron != nil {
+ 		app.updateCron.Stop()
+@@ -618,24 +631,26 @@ func (app *App) SetupUpdateTasks() {
+ 		slog.Info("检测到运行在 Docker 容器中,不执行自动更新")
+ 	}
+ 
+-	// 程序启动时更新
+-	if !StartFromGUI && enableSelfUpdate && updateOnStartup && !isDocker {
+-		updateDone := make(chan struct{})
+-		go func() {
+-			app.CheckUpdateAndRestart(false) // 启动时使用 false
+-			close(updateDone)
+-		}()
+-		<-updateDone
+-	} else {
+-		detectDone := make(chan struct{})
+-		go func() {
+-			_, _, err := app.detectLatestRelease()
+-			if err != nil {
+-				slog.Warn("检测更新错误", "error", err)
+-			}
+-			close(detectDone)
+-		}()
+-		<-detectDone
++	if runStartupCheck {
++		// 程序启动时更新
++		if !StartFromGUI && enableSelfUpdate && updateOnStartup && !isDocker {
++			updateDone := make(chan struct{})
++			go func() {
++				app.CheckUpdateAndRestart(false) // 启动时使用 false
++				close(updateDone)
++			}()
++			<-updateDone
++		} else {
++			detectDone := make(chan struct{})
++			go func() {
++				_, _, err := app.detectLatestRelease()
++				if err != nil {
++					slog.Warn("检测更新错误", "error", err)
++				}
++				close(detectDone)
++			}()
++			<-detectDone
++		}
+ 	}
+ 
+ 	// 设置定时更新任务
+diff --git a/app/auth_runtime.go b/app/auth_runtime.go
+new file mode 100644
+index 0000000..3dcdcac
+--- /dev/null
++++ b/app/auth_runtime.go
+@@ -0,0 +1,49 @@
++package app
++
++import (
++	"crypto/subtle"
++	"time"
++
++	"github.com/sinspired/subs-check-pro/v2/config"
++)
++
++const apiKeyGracePeriod = 5 * time.Minute
++
++type authKeyTransition struct {
++	Changed        bool   `json:"changed"`
++	State          string `json:"state"`
++	DesiredVersion uint64 `json:"desired_version"`
++	AppliedVersion uint64 `json:"applied_version"`
++}
++
++func constantTimeKeyEqual(candidate, expected string) bool {
++	if candidate == "" || expected == "" {
++		return false
++	}
++	return subtle.ConstantTimeCompare([]byte(candidate), []byte(expected)) == 1
++}
++
++func (app *App) recordAPIKeyTransition(previous, current string) {
++	if previous == "" || previous == current {
++		return
++	}
++	app.authMu.Lock()
++	app.previousAPIKey = previous
++	app.previousAPIKeyExpires = time.Now().Add(apiKeyGracePeriod)
++	app.authMu.Unlock()
++}
++
++func (app *App) authenticateAPIKey(candidate string) bool {
++	app.configReloadMu.Lock()
++	current := config.GlobalConfig.APIKey
++	app.configReloadMu.Unlock()
++	if constantTimeKeyEqual(candidate, current) {
++		return true
++	}
++
++	app.authMu.RLock()
++	previous := app.previousAPIKey
++	expires := app.previousAPIKeyExpires
++	app.authMu.RUnlock()
++	return time.Now().Before(expires) && constantTimeKeyEqual(candidate, previous)
++}
+diff --git a/app/auth_runtime_test.go b/app/auth_runtime_test.go
+new file mode 100644
+index 0000000..468f26f
+--- /dev/null
++++ b/app/auth_runtime_test.go
+@@ -0,0 +1,64 @@
++package app
++
++import (
++	"testing"
++	"time"
++
++	"github.com/sinspired/subs-check-pro/v2/config"
++)
++
++func TestAPIKeyTransitionKeepsPreviousKeyDuringGracePeriod(t *testing.T) {
++	original := *config.GlobalConfig
++	defer func() { *config.GlobalConfig = original }()
++
++	app := &App{}
++	config.GlobalConfig.APIKey = "new-key"
++	app.recordAPIKeyTransition("old-key", "new-key")
++
++	if !app.authenticateAPIKey("new-key") {
++		t.Fatal("new API key was rejected")
++	}
++	if !app.authenticateAPIKey("old-key") {
++		t.Fatal("previous API key was rejected during grace period")
++	}
++	app.authMu.Lock()
++	app.previousAPIKeyExpires = time.Now().Add(-time.Second)
++	app.authMu.Unlock()
++	if app.authenticateAPIKey("old-key") {
++		t.Fatal("expired previous API key was accepted")
++	}
++}
++
++func TestPendingAPIKeyChangesOnlyAfterCurrentCheck(t *testing.T) {
++	const oldConfig = `
++cron-expression: "0 5 * * *"
++check-interval: 10080
++api-key: "old-key"
++sub-store-port: ""
++`
++	const newConfig = `
++cron-expression: "0 5 * * *"
++check-interval: 10080
++api-key: "new-key"
++sub-store-port: ""
++`
++	app := newRuntimeConfigTestApp(t, oldConfig)
++	if !app.beginCheck() {
++		t.Fatal("check did not start")
++	}
++	writeRuntimeConfig(t, app.configPath, newConfig)
++	if _, err := app.onConfigChange(); err != nil {
++		t.Fatal(err)
++	}
++	if !app.authenticateAPIKey("old-key") || app.authenticateAPIKey("new-key") {
++		t.Fatal("API key changed before the current check finished")
++	}
++
++	app.finishCheck()
++	if !app.authenticateAPIKey("new-key") {
++		t.Fatal("new API key was not applied after the current check")
++	}
++	if !app.authenticateAPIKey("old-key") {
++		t.Fatal("old API key was not retained for transition grace")
++	}
++}
+diff --git a/app/config.go b/app/config.go
+index 13b2d87..2522829 100644
+--- a/app/config.go
++++ b/app/config.go
+@@ -285,6 +285,7 @@ func (app *App) onConfigChange() (configApplyStatus, error) {
+ func (app *App) applyRuntimeConfigLocked(nextConfig *config.Config, version uint64) {
+ 	oldUpdateSwitcher := config.GlobalConfig.EnableSelfUpdate
+ 	oldCronCheckUpdateExpr := config.GlobalConfig.CronCheckUpdate
++	oldAPIKey := config.GlobalConfig.APIKey
+ 
+ 	effectiveConfig := app.effectiveConfigLocked(nextConfig)
+ 	*config.GlobalConfig = *effectiveConfig
+@@ -305,16 +306,13 @@ func (app *App) applyRuntimeConfigLocked(nextConfig *config.Config, version uint
+ 	if config.GlobalConfig.APIKey == "" {
+ 		if apiKey := os.Getenv("API_KEY"); apiKey != "" {
+ 			config.GlobalConfig.APIKey = apiKey
+-		} else {
+-			if initAPIKey != "" {
+-				config.GlobalConfig.APIKey = utils.GenerateRandomString(10)
+-				slog.Warn("未设置api-key，key，已随机生成", "api-key", config.GlobalConfig.APIKey)
+-			} else {
+-				config.GlobalConfig.APIKey = geneAPIKey
+-				slog.Debug("保留首次运行自动生成的API key", "api-key", config.GlobalConfig.APIKey)
+-			}
++		} else if oldAPIKey != "" {
++			config.GlobalConfig.APIKey = oldAPIKey
++		} else if geneAPIKey != "" {
++			config.GlobalConfig.APIKey = geneAPIKey
+ 		}
+ 	}
++	app.recordAPIKeyTransition(oldAPIKey, config.GlobalConfig.APIKey)
+ 
+ 	subStoreSpec := app.subStoreSpecLocked(config.GlobalConfig)
+ 
+@@ -330,7 +328,7 @@ func (app *App) applyRuntimeConfigLocked(nextConfig *config.Config, version uint
+ 
+ 	if oldCronCheckUpdateExpr != config.GlobalConfig.CronCheckUpdate || oldUpdateSwitcher != config.GlobalConfig.EnableSelfUpdate {
+ 		slog.Warn("版本更新设置发生变化，重新设置定时更新任务")
+-		app.SetupUpdateTasks()
++		app.ReconfigureUpdateTasks()
+ 	}
+ 
+ 	app.appliedConfig = cloneConfig(config.GlobalConfig)
+diff --git a/app/config_policy.go b/app/config_policy.go
+new file mode 100644
+index 0000000..701e95a
+--- /dev/null
++++ b/app/config_policy.go
+@@ -0,0 +1,78 @@
++package app
++
++import (
++	"reflect"
++	"sort"
++	"strings"
++
++	"github.com/sinspired/subs-check-pro/v2/config"
++)
++
++const (
++	configEffectNextCheck            = "next-check"
++	configEffectRequestBoundary      = "request-boundary"
++	configEffectSchedulerReconfigure = "scheduler-reconfigure"
++	configEffectServiceReconfigure   = "service-reconfigure"
++	configEffectNextStartup          = "next-startup"
++	configEffectRestartRequired      = "restart-required"
++)
++
++type configFieldPolicy struct {
++	Path              string `json:"path"`
++	Effect            string `json:"effect"`
++	DuringActiveCheck string `json:"during_active_check"`
++}
++
++var configEffectOverrides = map[string]string{
++	"api-key":                configEffectRequestBoundary,
++	"share-password":         configEffectRequestBoundary,
++	"enable-web-ui":          configEffectRequestBoundary,
++	"cron-expression":        configEffectSchedulerReconfigure,
++	"check-interval":         configEffectSchedulerReconfigure,
++	"update":                 configEffectSchedulerReconfigure,
++	"cron-check-update":      configEffectSchedulerReconfigure,
++	"sub-store-port":         configEffectServiceReconfigure,
++	"sub-store-path":         configEffectServiceReconfigure,
++	"sub-store-sync-cron":    configEffectServiceReconfigure,
++	"sub-store-produce-cron": configEffectServiceReconfigure,
++	"sub-store-push-service": configEffectServiceReconfigure,
++	"mihomo-overwrite-url":   configEffectServiceReconfigure,
++	"output-dir":             configEffectServiceReconfigure,
++	"update-on-startup":      configEffectNextStartup,
++	"listen-port":            configEffectRestartRequired,
++}
++
++func configFieldPolicies() []configFieldPolicy {
++	policies := make([]configFieldPolicy, 0, 96)
++	collectConfigFieldPolicies(reflect.TypeOf(config.Config{}), "", &policies)
++	sort.Slice(policies, func(i, j int) bool {
++		return policies[i].Path < policies[j].Path
++	})
++	return policies
++}
++
++func collectConfigFieldPolicies(configType reflect.Type, prefix string, policies *[]configFieldPolicy) {
++	for index := 0; index < configType.NumField(); index++ {
++		field := configType.Field(index)
++		yamlName := strings.Split(field.Tag.Get("yaml"), ",")[0]
++		if yamlName == "" || yamlName == "-" {
++			continue
++		}
++		path := yamlName
++		if prefix != "" {
++			path = prefix + "." + yamlName
++		}
++		effect := configEffectOverrides[path]
++		if effect == "" {
++			effect = configEffectNextCheck
++		}
++		*policies = append(*policies, configFieldPolicy{
++			Path:              path,
++			Effect:            effect,
++			DuringActiveCheck: "after-current-check",
++		})
++		if field.Type.Kind() == reflect.Struct {
++			collectConfigFieldPolicies(field.Type, path, policies)
++		}
++	}
++}
+diff --git a/app/config_policy_test.go b/app/config_policy_test.go
+new file mode 100644
+index 0000000..ec117ba
+--- /dev/null
++++ b/app/config_policy_test.go
+@@ -0,0 +1,29 @@
++package app
++
++import "testing"
++
++func TestAllConfigFieldsHaveOneRuntimePolicy(t *testing.T) {
++	policies := configFieldPolicies()
++	if len(policies) != 96 {
++		t.Fatalf("runtime policy field count = %d, want 96", len(policies))
++	}
++	seen := make(map[string]configFieldPolicy, len(policies))
++	for _, policy := range policies {
++		if policy.Path == "" || policy.Effect == "" || policy.DuringActiveCheck == "" {
++			t.Fatalf("incomplete policy: %#v", policy)
++		}
++		if _, exists := seen[policy.Path]; exists {
++			t.Fatalf("duplicate policy for %q", policy.Path)
++		}
++		seen[policy.Path] = policy
++	}
++	for path, effect := range configEffectOverrides {
++		policy, exists := seen[path]
++		if !exists {
++			t.Fatalf("override references unknown config field %q", path)
++		}
++		if policy.Effect != effect {
++			t.Fatalf("policy for %q = %q, want %q", path, policy.Effect, effect)
++		}
++	}
++}
+diff --git a/app/config_runtime.go b/app/config_runtime.go
+index 1d0305c..91c4c03 100644
+--- a/app/config_runtime.go
++++ b/app/config_runtime.go
+@@ -3,6 +3,7 @@ package app
+ import (
+ 	"reflect"
+ 	"slices"
++	"time"
+ 
+ 	"github.com/sinspired/subs-check-pro/v2/config"
+ )
+@@ -11,17 +12,27 @@ const (
+ 	configStateApplied        = "applied"
+ 	configStatePendingNextRun = "pending-next-run"
+ 	configStatePendingService = "pending-service-reconfigure"
++	configStateNextStartup    = "next-startup"
+ 	configStateRestartNeeded  = "restart-required"
+ )
+ 
+ type configApplyStatus struct {
+-	State           string              `json:"state"`
+-	DesiredVersion  uint64              `json:"desired_version"`
+-	AppliedVersion  uint64              `json:"applied_version"`
+-	CheckVersion    uint64              `json:"check_version,omitempty"`
+-	Pending         bool                `json:"pending"`
+-	RestartRequired []string            `json:"restart_required"`
+-	SubStore        subStoreApplyStatus `json:"sub_store"`
++	State           string               `json:"state"`
++	DesiredVersion  uint64               `json:"desired_version"`
++	AppliedVersion  uint64               `json:"applied_version"`
++	CheckVersion    uint64               `json:"check_version,omitempty"`
++	Pending         bool                 `json:"pending"`
++	RestartRequired []string             `json:"restart_required"`
++	NextStartup     []string             `json:"next_startup"`
++	Scheduler       schedulerApplyStatus `json:"scheduler"`
++	SubStore        subStoreApplyStatus  `json:"sub_store"`
++}
++
++type schedulerApplyStatus struct {
++	Mode           string `json:"mode"`
++	CronExpression string `json:"cron_expression,omitempty"`
++	CheckInterval  int    `json:"check_interval,omitempty"`
++	NextRun        string `json:"next_run,omitempty"`
+ }
+ 
+ func cloneConfig(src *config.Config) *config.Config {
+@@ -84,7 +95,6 @@ func (app *App) effectiveConfigLocked(desired *config.Config) *config.Config {
+ 	// corresponding managers support safe live reconfiguration, keep runtime
+ 	// consumers on the values that are actually active and report a restart.
+ 	effective.ListenPort = app.startupConfig.ListenPort
+-	effective.EnableWebUI = app.startupConfig.EnableWebUI
+ 	return effective
+ }
+ 
+@@ -92,22 +102,31 @@ func (app *App) restartRequiredFieldsLocked() []string {
+ 	if app.startupConfig == nil || app.desiredConfig == nil {
+ 		return []string{}
+ 	}
+-	fields := make([]string, 0, 2)
++	fields := make([]string, 0, 1)
+ 	if app.startupConfig.ListenPort != app.desiredConfig.ListenPort {
+ 		fields = append(fields, "listen-port")
+ 	}
+-	if app.startupConfig.EnableWebUI != app.desiredConfig.EnableWebUI {
+-		fields = append(fields, "enable-web-ui")
+-	}
+ 	return fields
+ }
+ 
++func (app *App) nextStartupFieldsLocked() []string {
++	if app.startupConfig == nil || app.desiredConfig == nil {
++		return []string{}
++	}
++	if app.startupConfig.UpdateOnStartup != app.desiredConfig.UpdateOnStartup {
++		return []string{"update-on-startup"}
++	}
++	return []string{}
++}
++
+ func (app *App) configStatusLocked() configApplyStatus {
+ 	restartRequired := app.restartRequiredFieldsLocked()
++	nextStartup := app.nextStartupFieldsLocked()
+ 	subStoreStatus := subStoreApplyStatus{State: subStoreStateDisabled}
+ 	if app.subStoreManager != nil {
+ 		subStoreStatus = app.subStoreManager.Status()
+ 	}
++	schedulerStatus := app.schedulerStatusLocked()
+ 	state := configStateApplied
+ 	if app.pendingConfig != nil {
+ 		state = configStatePendingNextRun
+@@ -115,6 +134,8 @@ func (app *App) configStatusLocked() configApplyStatus {
+ 		state = configStatePendingService
+ 	} else if len(restartRequired) > 0 {
+ 		state = configStateRestartNeeded
++	} else if len(nextStartup) > 0 {
++		state = configStateNextStartup
+ 	}
+ 	return configApplyStatus{
+ 		State:           state,
+@@ -123,10 +144,42 @@ func (app *App) configStatusLocked() configApplyStatus {
+ 		CheckVersion:    app.checkConfigVersion.Load(),
+ 		Pending:         app.pendingConfig != nil,
+ 		RestartRequired: restartRequired,
++		NextStartup:     nextStartup,
++		Scheduler:       schedulerStatus,
+ 		SubStore:        subStoreStatus,
+ 	}
+ }
+ 
++func (app *App) schedulerStatusLocked() schedulerApplyStatus {
++	appliedCron, _ := app.appliedTimerCron.Load().(string)
++	status := schedulerApplyStatus{
++		Mode:           "interval",
++		CheckInterval:  int(app.appliedTimerInterval.Load()),
++		CronExpression: appliedCron,
++	}
++	if appliedCron == "" {
++		return status
++	}
++	status.Mode = "cron"
++	if app.cron == nil {
++		return status
++	}
++	for _, entry := range app.cron.Entries() {
++		if entry.Next.IsZero() {
++			continue
++		}
++		if status.NextRun == "" {
++			status.NextRun = entry.Next.Format(time.RFC3339)
++			continue
++		}
++		current, err := time.Parse(time.RFC3339, status.NextRun)
++		if err == nil && entry.Next.Before(current) {
++			status.NextRun = entry.Next.Format(time.RFC3339)
++		}
++	}
++	return status
++}
++
+ func (app *App) configStatus() configApplyStatus {
+ 	app.configReloadMu.Lock()
+ 	defer app.configReloadMu.Unlock()
+diff --git a/app/config_runtime_test.go b/app/config_runtime_test.go
+index e0cf7b3..e53b8b1 100644
+--- a/app/config_runtime_test.go
++++ b/app/config_runtime_test.go
+@@ -76,6 +76,28 @@ func TestCloneConfigDeepCopiesSlices(t *testing.T) {
+ 	}
+ }
+ 
++func TestSchedulerStatusReportsActualCronAndNextRun(t *testing.T) {
++	const runtimeConfig = `
++cron-expression: "0 5,19 * * *"
++check-interval: 10080
++sub-store-port: ""
++`
++	app := newRuntimeConfigTestApp(t, runtimeConfig)
++	status := app.configStatus()
++	if status.Scheduler.Mode != "cron" ||
++		status.Scheduler.CronExpression != "0 5,19 * * *" ||
++		status.Scheduler.NextRun == "" {
++		t.Fatalf("scheduler status = %#v", status.Scheduler)
++	}
++	nextRun, err := time.Parse(time.RFC3339, status.Scheduler.NextRun)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if nextRun.Minute() != 0 || (nextRun.Hour() != 5 && nextRun.Hour() != 19) {
++		t.Fatalf("next cron run = %s, want 05:00 or 19:00", nextRun)
++	}
++}
++
+ func TestConfigReloadDefersPublicationUntilCheckFinishes(t *testing.T) {
+ 	const oldConfig = `
+ cron-expression: "0 5 * * *"
+@@ -155,14 +177,16 @@ sub-store-port: ""
+ 	if status.State != configStateRestartNeeded {
+ 		t.Fatalf("state = %q, want %q", status.State, configStateRestartNeeded)
+ 	}
+-	wantRestart := []string{"listen-port", "enable-web-ui"}
++	wantRestart := []string{"listen-port"}
+ 	if !slices.Equal(status.RestartRequired, wantRestart) {
+ 		t.Fatalf("restart fields = %#v, want %#v", status.RestartRequired, wantRestart)
+ 	}
+-	if config.GlobalConfig.ListenPort != "127.0.0.1:8199" ||
+-		!config.GlobalConfig.EnableWebUI {
++	if config.GlobalConfig.ListenPort != "127.0.0.1:8199" {
+ 		t.Fatalf("startup-bound runtime fields changed: %#v", config.GlobalConfig)
+ 	}
++	if config.GlobalConfig.EnableWebUI {
++		t.Fatal("enable-web-ui did not apply live")
++	}
+ 	if config.GlobalConfig.OutputDir != "new-output" {
+ 		t.Fatalf("output-dir did not apply live: %q", config.GlobalConfig.OutputDir)
+ 	}
+@@ -190,6 +214,36 @@ sub-store-port: ""
+ 	}
+ }
+ 
++func TestUpdateOnStartupReportsNextStartupWithoutRunningStartupFlow(t *testing.T) {
++	const oldConfig = `
++cron-expression: "0 5 * * *"
++check-interval: 10080
++update: false
++update-on-startup: true
++sub-store-port: ""
++`
++	const newConfig = `
++cron-expression: "0 5 * * *"
++check-interval: 10080
++update: false
++update-on-startup: false
++sub-store-port: ""
++`
++	app := newRuntimeConfigTestApp(t, oldConfig)
++	writeRuntimeConfig(t, app.configPath, newConfig)
++	status, err := app.onConfigChange()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if status.State != configStateNextStartup ||
++		!slices.Equal(status.NextStartup, []string{"update-on-startup"}) {
++		t.Fatalf("status = %#v, want next-startup", status)
++	}
++	if config.GlobalConfig.UpdateOnStartup {
++		t.Fatal("runtime config did not retain the saved next-startup value")
++	}
++}
++
+ func TestConcurrentEquivalentReloadsCreateOnePendingVersion(t *testing.T) {
+ 	const oldConfig = `
+ cron-expression: "0 5 * * *"
+diff --git a/app/server.go b/app/server.go
+index ea378cc..a65d89d 100644
+--- a/app/server.go
++++ b/app/server.go
+@@ -3,7 +3,6 @@ package app
+ 
+ import (
+ 	"bufio"
+-	"crypto/subtle"
+ 	"fmt"
+ 	"html/template"
+ 	"io/fs"
+@@ -57,7 +56,6 @@ var publicStaticFileList = []struct {
+ }
+ 
+ var (
+-	initAPIKey string
+ 	geneAPIKey string
+ )
+ 
+@@ -87,28 +85,10 @@ func (app *App) initHTTPServer() error {
+ 
+ 	app.registerShareRoutes(router)
+ 
+-	// 注册WebUI 路由
+-	if !config.GlobalConfig.EnableWebUI {
+-		if config.GlobalConfig.APIKey == "" {
+-			// WebUI 禁用 + APIKey 未设置
+-			slog.Info("Web控制面板已禁用, 且未设置 api-key")
+-			router.GET(AdminPath, func(c *gin.Context) {
+-				c.String(http.StatusForbidden,
+-					"Web 控制面板已禁用，请在配置中启用 EnableWebUI，并设置 api-key")
+-			})
+-		} else {
+-			// WebUI 禁用 + APIKey 已设置
+-			slog.Info("Web控制面板已禁用, 仍可通过 api-key 访问订阅文件",
+-				"api-key", config.GlobalConfig.APIKey)
+-			router.GET(AdminPath, func(c *gin.Context) {
+-				c.String(http.StatusForbidden,
+-					"Web 控制面板已禁用，请在配置中启用 EnableWebUI")
+-			})
+-		}
+-	} else {
+-		// WebUI 启用
+-		app.registerWebUIRoutes(router)
+-	}
++	// The route stays registered for the life of the HTTP server. Its handler
++	// checks the applied config on every request so enable-web-ui can be changed
++	// without rebuilding the router or restarting the process.
++	app.registerWebUIRoutes(router)
+ 
+ 	// 注册 API 和 主题、版本号、分析报告等路由
+ 	app.registerPublicRoutes(router)
+@@ -148,7 +128,8 @@ func (app *App) initHTTPServer() error {
+ 
+ // ensureAPIKey 如未设置，生成一个随机值
+ func (app *App) ensureAPIKey() {
+-	initAPIKey = config.GlobalConfig.APIKey
++	app.configReloadMu.Lock()
++	defer app.configReloadMu.Unlock()
+ 	if config.GlobalConfig.APIKey == "" {
+ 		if apiKey := os.Getenv("API_KEY"); apiKey != "" {
+ 			config.GlobalConfig.APIKey = apiKey
+@@ -159,6 +140,9 @@ func (app *App) ensureAPIKey() {
+ 			slog.Warn("未设置api-key，已随机生成", "api-key", config.GlobalConfig.APIKey)
+ 		}
+ 	}
++	if app.appliedConfig != nil {
++		app.appliedConfig.APIKey = config.GlobalConfig.APIKey
++	}
+ }
+ 
+ // silentLoggerMiddleware 通过软件自身发出的部分请求，不显示日志
+@@ -263,6 +247,14 @@ func corsWails(c *gin.Context) {
+ // registerWebUIRoutes 注册WebUI路由
+ func (app *App) registerWebUIRoutes(router *gin.Engine) {
+ 	router.GET(AdminPath, func(c *gin.Context) {
++		app.configReloadMu.Lock()
++		enabled := config.GlobalConfig.EnableWebUI
++		app.configReloadMu.Unlock()
++		if !enabled {
++			c.String(http.StatusForbidden,
++				"Web 控制面板已禁用。请在配置文件中将 enable-web-ui 设为 true 后重新访问；API 与订阅下载仍保持运行。")
++			return
++		}
+ 		c.HTML(http.StatusOK, "admin.html", gin.H{
+ 			"configPath": app.configPath,
+ 		})
+@@ -313,7 +305,7 @@ func (app *App) registerAPIRoutes(router *gin.Engine) {
+ func (app *App) authMiddleware() gin.HandlerFunc {
+ 	return func(c *gin.Context) {
+ 		apiKey := c.GetHeader(APIAuthHeader)
+-		if subtle.ConstantTimeCompare([]byte(apiKey), []byte(config.GlobalConfig.APIKey)) != 1 {
++		if !app.authenticateAPIKey(apiKey) {
+ 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "无效的API密钥"})
+ 			return
+ 		}
+@@ -362,6 +354,7 @@ func (app *App) getConfig(c *gin.Context) {
+ 		"content":        string(configData),
+ 		"sub_store_path": subStorePath,
+ 		"config_status":  status,
++		"field_policy":   configFieldPolicies(),
+ 	})
+ }
+ 
+@@ -384,6 +377,12 @@ func (app *App) updateConfig(c *gin.Context) {
+ 		c.JSON(http.StatusBadRequest, gin.H{"error": "配置字段类型错误: " + err.Error()})
+ 		return
+ 	}
++	app.configReloadMu.Lock()
++	activeAPIKey := ""
++	if app.appliedConfig != nil {
++		activeAPIKey = app.appliedConfig.APIKey
++	}
++	app.configReloadMu.Unlock()
+ 
+ 	var nextConfig struct {
+ 		SubURLs []string `yaml:"sub-urls"`
+@@ -426,14 +425,34 @@ func (app *App) updateConfig(c *gin.Context) {
+ 		return
+ 	}
+ 	message := "配置已更新并生效"
+-	if status.Pending {
++	switch status.State {
++	case configStatePendingNextRun:
+ 		message = "配置已保存，将在当前检测结束后生效"
+-	} else if len(status.RestartRequired) > 0 {
++	case configStatePendingService:
++		message = "配置已保存，托管服务正在应用最新运行规格"
++	case configStateRestartNeeded:
+ 		message = "配置已保存；部分设置需重启后生效"
++	case configStateNextStartup:
++		message = "配置已保存；启动行为将在下次启动时使用"
++	}
++	desiredAPIKey := strings.TrimSpace(validatedConfig.APIKey)
++	authChanged := desiredAPIKey != "" && desiredAPIKey != activeAPIKey
++	authState := "unchanged"
++	if authChanged {
++		authState = "pending"
++		if status.AppliedVersion >= status.DesiredVersion && app.authenticateAPIKey(desiredAPIKey) {
++			authState = "applied"
++		}
+ 	}
+ 	c.JSON(http.StatusOK, gin.H{
+ 		"message":       message,
+ 		"config_status": status,
++		"auth_transition": authKeyTransition{
++			Changed:        authChanged,
++			State:          authState,
++			DesiredVersion: status.DesiredVersion,
++			AppliedVersion: status.AppliedVersion,
++		},
+ 	})
+ }
+ 
+diff --git a/app/substore_manager_test.go b/app/substore_manager_test.go
+index f3fa4c2..9aa628d 100644
+--- a/app/substore_manager_test.go
++++ b/app/substore_manager_test.go
+@@ -90,6 +90,10 @@ func TestSubStoreManagerCoalescesRapidChangesAndNeverOverlapsRunners(t *testing.
+ 	status := waitForSubStoreStatus(t, manager, func(status subStoreApplyStatus) bool {
+ 		return status.AppliedVersion == 10 && !status.Pending
+ 	})
++	deadline := time.Now().Add(time.Second)
++	for maxActive.Load() == 0 && time.Now().Before(deadline) {
++		time.Sleep(time.Millisecond)
++	}
+ 	if maxActive.Load() != 1 {
+ 		t.Fatalf("maximum concurrent runners = %d, want 1", maxActive.Load())
+ 	}
+diff --git a/app/webui_runtime_test.go b/app/webui_runtime_test.go
+new file mode 100644
+index 0000000..806e4a0
+--- /dev/null
++++ b/app/webui_runtime_test.go
+@@ -0,0 +1,38 @@
++package app
++
++import (
++	"html/template"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++
++	"github.com/gin-gonic/gin"
++	"github.com/sinspired/subs-check-pro/v2/config"
++)
++
++func TestWebUIAccessFollowsAppliedConfigWithoutRouterRestart(t *testing.T) {
++	original := *config.GlobalConfig
++	defer func() { *config.GlobalConfig = original }()
++
++	gin.SetMode(gin.TestMode)
++	router := gin.New()
++	router.SetHTMLTemplate(template.Must(template.New("admin.html").Parse(`{{define "admin.html"}}admin{{end}}`)))
++	app := &App{configPath: "config.yaml"}
++	app.registerWebUIRoutes(router)
++
++	request := func() *httptest.ResponseRecorder {
++		response := httptest.NewRecorder()
++		router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, AdminPath, nil))
++		return response
++	}
++
++	config.GlobalConfig.EnableWebUI = false
++	if response := request(); response.Code != http.StatusForbidden {
++		t.Fatalf("disabled WebUI status = %d, want 403", response.Code)
++	}
++	config.GlobalConfig.EnableWebUI = true
++	response := request()
++	if response.Code != http.StatusOK || response.Body.String() != "admin" {
++		t.Fatalf("enabled WebUI response = (%d, %q)", response.Code, response.Body.String())
++	}
++}
